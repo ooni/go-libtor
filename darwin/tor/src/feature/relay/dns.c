@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -59,10 +59,11 @@
 #include "core/or/connection_edge.h"
 #include "core/or/policies.h"
 #include "core/or/relay.h"
-#include "feature/control/control.h"
+#include "feature/control/control_events.h"
 #include "feature/relay/dns.h"
 #include "feature/relay/router.h"
 #include "feature/relay/routermode.h"
+#include "feature/stats/rephist.h"
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/evloop/compat_libevent.h"
 #include "lib/sandbox/sandbox.h"
@@ -146,9 +147,9 @@ cached_resolve_hash(cached_resolve_t *a)
 }
 
 HT_PROTOTYPE(cache_map, cached_resolve_t, node, cached_resolve_hash,
-             cached_resolves_eq)
+             cached_resolves_eq);
 HT_GENERATE2(cache_map, cached_resolve_t, node, cached_resolve_hash,
-             cached_resolves_eq, 0.6, tor_reallocarray_, tor_free_)
+             cached_resolves_eq, 0.6, tor_reallocarray_, tor_free_);
 
 /** Initialize the DNS cache. */
 static void
@@ -266,22 +267,6 @@ int
 has_dns_init_failed(void)
 {
   return nameserver_config_failed;
-}
-
-/** Helper: Given a TTL from a DNS response, determine what TTL to give the
- * OP that asked us to resolve it, and how long to cache that record
- * ourselves. */
-uint32_t
-dns_clip_ttl(uint32_t ttl)
-{
-  /* This logic is a defense against "DefectTor" DNS-based traffic
-   * confirmation attacks, as in https://nymity.ch/tor-dns/tor-dns.pdf .
-   * We only give two values: a "low" value and a "high" value.
-   */
-  if (ttl < MIN_DNS_TTL_AT_EXIT)
-    return MIN_DNS_TTL_AT_EXIT;
-  else
-    return MAX_DNS_TTL_AT_EXIT;
 }
 
 /** Helper: free storage held by an entry in the DNS cache. */
@@ -521,7 +506,7 @@ send_resolved_cell,(edge_connection_t *conn, uint8_t answer_type,
   uint32_t ttl;
 
   buf[0] = answer_type;
-  ttl = dns_clip_ttl(conn->address_ttl);
+  ttl = clip_dns_ttl(conn->address_ttl);
 
   switch (answer_type)
     {
@@ -593,7 +578,7 @@ send_resolved_hostname_cell,(edge_connection_t *conn,
   size_t namelen = strlen(hostname);
 
   tor_assert(namelen < 256);
-  ttl = dns_clip_ttl(conn->address_ttl);
+  ttl = clip_dns_ttl(conn->address_ttl);
 
   buf[0] = RESOLVED_TYPE_HOSTNAME;
   buf[1] = (uint8_t)namelen;
@@ -987,25 +972,6 @@ assert_connection_edge_not_dns_pending(edge_connection_t *conn)
 #endif /* 1 */
 }
 
-/** Log an error and abort if any connection waiting for a DNS resolve is
- * corrupted. */
-void
-assert_all_pending_dns_resolves_ok(void)
-{
-  pending_connection_t *pend;
-  cached_resolve_t **resolve;
-
-  HT_FOREACH(resolve, cache_map, &cache_root) {
-    for (pend = (*resolve)->pending_connections;
-         pend;
-         pend = pend->next) {
-      assert_connection_ok(TO_CONN(pend->conn), 0);
-      tor_assert(!SOCKET_OK(pend->conn->base_.s));
-      tor_assert(!connection_in_array(TO_CONN(pend->conn)));
-    }
-  }
-}
-
 /** Remove <b>conn</b> from the list of connections waiting for conn-\>address.
  */
 void
@@ -1063,7 +1029,7 @@ connection_dns_remove(edge_connection_t *conn)
  * the resolve for <b>address</b> itself, and remove any cached results for
  * <b>address</b> from the cache.
  */
-MOCK_IMPL(void,
+MOCK_IMPL(STATIC void,
 dns_cancel_pending_resolve,(const char *address))
 {
   pending_connection_t *pend;
@@ -1338,7 +1304,7 @@ make_pending_resolve_cached(cached_resolve_t *resolve)
         resolve->ttl_hostname < ttl)
       ttl = resolve->ttl_hostname;
 
-    set_expiry(new_resolve, time(NULL) + dns_clip_ttl(ttl));
+    set_expiry(new_resolve, time(NULL) + clip_dns_ttl(ttl));
   }
 
   assert_cache_ok();
@@ -1359,6 +1325,42 @@ evdns_err_is_transient(int err)
       return 0;
   }
 }
+
+/**
+ * Return number of configured nameservers in <b>the_evdns_base</b>.
+ */
+size_t
+number_of_configured_nameservers(void)
+{
+  return evdns_base_count_nameservers(the_evdns_base);
+}
+
+#ifdef HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR
+/**
+ * Return address of configured nameserver in <b>the_evdns_base</b>
+ * at index <b>idx</b>.
+ */
+tor_addr_t *
+configured_nameserver_address(const size_t idx)
+{
+ struct sockaddr_storage sa;
+ ev_socklen_t sa_len = sizeof(sa);
+
+ if (evdns_base_get_nameserver_addr(the_evdns_base, (int)idx,
+                                    (struct sockaddr *)&sa,
+                                    sa_len) > 0) {
+   tor_addr_t *tor_addr = tor_malloc(sizeof(tor_addr_t));
+   if (tor_addr_from_sockaddr(tor_addr,
+                              (const struct sockaddr *)&sa,
+                              NULL) == 0) {
+     return tor_addr;
+   }
+   tor_free(tor_addr);
+ }
+
+ return NULL;
+}
+#endif /* defined(HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR) */
 
 /** Configure eventdns nameservers if force is true, or if the configuration
  * has changed since the last time we called this function, or if we failed on
@@ -1391,16 +1393,23 @@ configure_nameservers(int force)
   evdns_set_log_fn(evdns_log_cb);
   if (conf_fname) {
     log_debug(LD_FS, "stat()ing %s", conf_fname);
-    if (stat(sandbox_intern_string(conf_fname), &st)) {
+    int missing_resolv_conf = 0;
+    int stat_res = stat(sandbox_intern_string(conf_fname), &st);
+
+    if (stat_res) {
       log_warn(LD_EXIT, "Unable to stat resolver configuration in '%s': %s",
                conf_fname, strerror(errno));
-      goto err;
-    }
-    if (!force && resolv_conf_fname && !strcmp(conf_fname,resolv_conf_fname)
+      missing_resolv_conf = 1;
+    } else if (!force && resolv_conf_fname &&
+               !strcmp(conf_fname,resolv_conf_fname)
         && st.st_mtime == resolv_conf_mtime) {
       log_info(LD_EXIT, "No change to '%s'", conf_fname);
       return 0;
     }
+
+    if (stat_res == 0 && st.st_size == 0)
+      missing_resolv_conf = 1;
+
     if (nameservers_configured) {
       evdns_base_search_clear(the_evdns_base);
       evdns_base_clear_nameservers_and_suspend(the_evdns_base);
@@ -1413,20 +1422,34 @@ configure_nameservers(int force)
           sandbox_intern_string("/etc/hosts"));
     }
 #endif /* defined(DNS_OPTION_HOSTSFILE) && defined(USE_LIBSECCOMP) */
-    log_info(LD_EXIT, "Parsing resolver configuration in '%s'", conf_fname);
-    if ((r = evdns_base_resolv_conf_parse(the_evdns_base, flags,
-        sandbox_intern_string(conf_fname)))) {
-      log_warn(LD_EXIT, "Unable to parse '%s', or no nameservers in '%s' (%d)",
-               conf_fname, conf_fname, r);
-      goto err;
+
+    if (!missing_resolv_conf) {
+      log_info(LD_EXIT, "Parsing resolver configuration in '%s'", conf_fname);
+      if ((r = evdns_base_resolv_conf_parse(the_evdns_base, flags,
+          sandbox_intern_string(conf_fname)))) {
+        log_warn(LD_EXIT, "Unable to parse '%s', or no nameservers "
+                          "in '%s' (%d)", conf_fname, conf_fname, r);
+
+        if (r != 6) // "r = 6" means "no DNS servers were in resolv.conf" -
+          goto err; // in which case we expect libevent to add 127.0.0.1 as
+                    // fallback.
+      }
+      if (evdns_base_count_nameservers(the_evdns_base) == 0) {
+        log_warn(LD_EXIT, "Unable to find any nameservers in '%s'.",
+                 conf_fname);
+      }
+
+      tor_free(resolv_conf_fname);
+      resolv_conf_fname = tor_strdup(conf_fname);
+      resolv_conf_mtime = st.st_mtime;
+    } else {
+      log_warn(LD_EXIT, "Could not read your DNS config from '%s' - "
+                        "please investigate your DNS configuration. "
+                        "This is possibly a problem. Meanwhile, falling"
+                        " back to local DNS at 127.0.0.1.", conf_fname);
+      evdns_base_nameserver_ip_add(the_evdns_base, "127.0.0.1");
     }
-    if (evdns_base_count_nameservers(the_evdns_base) == 0) {
-      log_warn(LD_EXIT, "Unable to find any nameservers in '%s'.", conf_fname);
-      goto err;
-    }
-    tor_free(resolv_conf_fname);
-    resolv_conf_fname = tor_strdup(conf_fname);
-    resolv_conf_mtime = st.st_mtime;
+
     if (nameservers_configured)
       evdns_base_resume(the_evdns_base);
   }
@@ -1525,6 +1548,16 @@ evdns_callback(int result, char type, int count, int ttl, void *addresses,
 
   tor_addr_make_unspec(&addr);
 
+  /* Note down any DNS errors to the statistics module */
+  if (result == DNS_ERR_TIMEOUT) {
+    /* libevent timed out while resolving a name. However, because libevent
+     * handles retries and timeouts internally, this means that all attempts of
+     * libevent timed out. If we wanted to get more granular information about
+     * individual libevent attempts, we would have to implement our own DNS
+     * timeout/retry logic */
+    rep_hist_note_overload(OVERLOAD_GENERAL);
+  }
+
   /* Keep track of whether IPv6 is working */
   if (type == DNS_IPv6_AAAA) {
     if (result == DNS_ERR_TIMEOUT) {
@@ -1569,12 +1602,17 @@ evdns_callback(int result, char type, int count, int ttl, void *addresses,
     } else if (type == DNS_IPv6_AAAA && count) {
       char answer_buf[TOR_ADDR_BUF_LEN];
       char *escaped_address;
+      const char *ip_str;
       struct in6_addr *addrs = addresses;
       tor_addr_from_in6(&addr, &addrs[0]);
-      tor_inet_ntop(AF_INET6, &addrs[0], answer_buf, sizeof(answer_buf));
+      ip_str = tor_inet_ntop(AF_INET6, &addrs[0], answer_buf,
+                             sizeof(answer_buf));
       escaped_address = esc_for_log(string_address);
 
-      if (answer_is_wildcarded(answer_buf)) {
+      if (BUG(ip_str == NULL)) {
+        log_warn(LD_EXIT, "tor_inet_ntop() failed!");
+        result = DNS_ERR_NOTEXIST;
+      } else if (answer_is_wildcarded(answer_buf)) {
         log_debug(LD_EXIT, "eventdns said that %s resolves to ISP-hijacked "
                   "address %s; treating as a failure.",
                   safe_str(escaped_address),
@@ -1664,7 +1702,7 @@ launch_one_resolve(const char *address, uint8_t query_type,
       log_warn(LD_BUG, "Called with PTR query and unexpected address family");
     break;
   default:
-    log_warn(LD_BUG, "Called with unexpectd query type %d", (int)query_type);
+    log_warn(LD_BUG, "Called with unexpected query type %d", (int)query_type);
     break;
   }
 
@@ -1841,6 +1879,7 @@ evdns_wildcard_check_callback(int result, char type, int count, int ttl,
                               void *addresses, void *arg)
 {
   (void)ttl;
+  const char *ip_str;
   ++n_wildcard_requests;
   if (result == DNS_ERR_NONE && count) {
     char *string_address = arg;
@@ -1850,16 +1889,22 @@ evdns_wildcard_check_callback(int result, char type, int count, int ttl,
       for (i = 0; i < count; ++i) {
         char answer_buf[INET_NTOA_BUF_LEN+1];
         struct in_addr in;
+        int ntoa_res;
         in.s_addr = addrs[i];
-        tor_inet_ntoa(&in, answer_buf, sizeof(answer_buf));
-        wildcard_increment_answer(answer_buf);
+        ntoa_res = tor_inet_ntoa(&in, answer_buf, sizeof(answer_buf));
+        tor_assert_nonfatal(ntoa_res >= 0);
+        if (ntoa_res > 0)
+          wildcard_increment_answer(answer_buf);
       }
     } else if (type == DNS_IPv6_AAAA) {
       const struct in6_addr *addrs = addresses;
       for (i = 0; i < count; ++i) {
         char answer_buf[TOR_ADDR_BUF_LEN+1];
-        tor_inet_ntop(AF_INET6, &addrs[i], answer_buf, sizeof(answer_buf));
-        wildcard_increment_answer(answer_buf);
+        ip_str = tor_inet_ntop(AF_INET6, &addrs[i], answer_buf,
+                               sizeof(answer_buf));
+        tor_assert_nonfatal(ip_str);
+        if (ip_str)
+          wildcard_increment_answer(answer_buf);
       }
     }
 
@@ -1994,12 +2039,12 @@ dns_launch_correctness_checks(void)
 
   /* Wait a while before launching requests for test addresses, so we can
    * get the results from checking for wildcarding. */
-  if (! launch_event)
+  if (!launch_event)
     launch_event = tor_evtimer_new(tor_libevent_get_base(),
                                    launch_test_addresses, NULL);
   timeout.tv_sec = 30;
   timeout.tv_usec = 0;
-  if (evtimer_add(launch_event, &timeout)<0) {
+  if (evtimer_add(launch_event, &timeout) < 0) {
     log_warn(LD_BUG, "Couldn't add timer for checking for dns hijacking");
   }
 }
@@ -2131,7 +2176,7 @@ dns_cache_handle_oom(time_t now, size_t min_remove_bytes)
     total_bytes_removed += bytes_removed;
 
     /* Increase time_inc by a reasonable fraction. */
-    time_inc += (MAX_DNS_TTL_AT_EXIT / 4);
+    time_inc += (MAX_DNS_TTL / 4);
   } while (total_bytes_removed < min_remove_bytes);
 
   return total_bytes_removed;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2019, The Tor Project, Inc. */
+/* Copyright (c) 2014-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -37,11 +37,11 @@
 
 #include "core/or/or_handshake_certs_st.h"
 
-/** Helper for tor_cert_create(): signs any 32 bytes, not just an ed25519
- * key.
+/** As tor_cert_create(), but accept an arbitrary signed_key_type as the
+ * subject key -- not just an ed25519 key.
  */
-static tor_cert_t *
-tor_cert_sign_impl(const ed25519_keypair_t *signing_key,
+tor_cert_t *
+tor_cert_create_raw(const ed25519_keypair_t *signing_key,
                       uint8_t cert_type,
                       uint8_t signed_key_type,
                       const uint8_t signed_key_info[32],
@@ -74,7 +74,7 @@ tor_cert_sign_impl(const ed25519_keypair_t *signing_key,
   tor_assert(real_len == alloc_len);
   tor_assert(real_len > ED25519_SIG_LEN);
   uint8_t *sig = encoded + (real_len - ED25519_SIG_LEN);
-  tor_assert(tor_mem_is_zero((char*)sig, ED25519_SIG_LEN));
+  tor_assert(fast_mem_is_zero((char*)sig, ED25519_SIG_LEN));
 
   ed25519_signature_t signature;
   if (ed25519_sign(&signature, encoded,
@@ -128,13 +128,13 @@ tor_cert_sign_impl(const ed25519_keypair_t *signing_key,
  * the public part of <b>signing_key</b> in the certificate.
  */
 tor_cert_t *
-tor_cert_create(const ed25519_keypair_t *signing_key,
+tor_cert_create_ed25519(const ed25519_keypair_t *signing_key,
                 uint8_t cert_type,
                 const ed25519_public_key_t *signed_key,
                 time_t now, time_t lifetime,
                 uint32_t flags)
 {
-  return tor_cert_sign_impl(signing_key, cert_type,
+  return tor_cert_create_raw(signing_key, cert_type,
                             SIGNED_KEY_TYPE_ED25519, signed_key->pubkey,
                             now, lifetime, flags);
 }
@@ -290,8 +290,8 @@ tor_cert_describe_signature_status(const tor_cert_t *cert)
 }
 
 /** Return a new copy of <b>cert</b> */
-tor_cert_t *
-tor_cert_dup(const tor_cert_t *cert)
+MOCK_IMPL(tor_cert_t *,
+tor_cert_dup,(const tor_cert_t *cert))
 {
   tor_cert_t *newcert = tor_memdup(cert, sizeof(tor_cert_t));
   if (cert->encoded)

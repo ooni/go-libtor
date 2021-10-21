@@ -829,7 +829,8 @@ int event_base_set(struct event_base *eb, struct event *ev);
 
   @param eb the event_base structure returned by event_base_new() or
      event_base_new_with_config()
-  @param flags any combination of EVLOOP_ONCE | EVLOOP_NONBLOCK
+  @param flags any combination of EVLOOP_ONCE | EVLOOP_NONBLOCK |
+     EVLOOP_NO_EXIT_ON_EMPTY
   @return 0 if successful, -1 if an error occurred, or 1 if we exited because
      no events were pending or active.
   @see event_base_loopexit(), event_base_dispatch(), EVLOOP_ONCE,
@@ -1078,7 +1079,7 @@ void *event_self_cbarg(void);
   The EV_TIMEOUT flag has no effect here.
 
   It is okay to have multiple events all listening on the same fds; but
-  they must either all be edge-triggered, or all not be edge triggered.
+  they must either all be edge-triggered, or not be edge-triggered at all.
 
   When the event becomes active, the event loop will run the provided
   callback function, with three arguments.  The first will be the provided

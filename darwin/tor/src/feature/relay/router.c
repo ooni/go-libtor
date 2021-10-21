@@ -1,13 +1,14 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define ROUTER_PRIVATE
 
 #include "core/or/or.h"
 #include "app/config/config.h"
+#include "app/config/resolve_addr.h"
 #include "app/config/statefile.h"
 #include "app/main/main.h"
 #include "core/mainloop/connection.h"
@@ -16,7 +17,7 @@
 #include "core/or/policies.h"
 #include "core/or/protover.h"
 #include "feature/client/transports.h"
-#include "feature/control/control.h"
+#include "feature/control/control_events.h"
 #include "feature/dirauth/process_descs.h"
 #include "feature/dircache/dirserv.h"
 #include "feature/dirclient/dirclient.h"
@@ -30,16 +31,21 @@
 #include "feature/nodelist/dirlist.h"
 #include "feature/nodelist/networkstatus.h"
 #include "feature/nodelist/nickname.h"
+#include "feature/nodelist/nodefamily.h"
 #include "feature/nodelist/nodelist.h"
 #include "feature/nodelist/routerlist.h"
 #include "feature/nodelist/torcert.h"
 #include "feature/relay/dns.h"
+#include "feature/relay/relay_config.h"
+#include "feature/relay/relay_find_addr.h"
+#include "feature/relay/relay_periodic.h"
 #include "feature/relay/router.h"
 #include "feature/relay/routerkeys.h"
 #include "feature/relay/routermode.h"
 #include "feature/relay/selftest.h"
 #include "lib/geoip/geoip.h"
 #include "feature/stats/geoip_stats.h"
+#include "feature/stats/bwhist.h"
 #include "feature/stats/rephist.h"
 #include "lib/crypt_ops/crypto_ed25519.h"
 #include "lib/crypt_ops/crypto_format.h"
@@ -49,6 +55,7 @@
 #include "lib/encoding/confline.h"
 #include "lib/osinfo/uname.h"
 #include "lib/tls/tortls.h"
+#include "lib/version/torversion.h"
 
 #include "feature/dirauth/authmode.h"
 
@@ -58,6 +65,7 @@
 #include "feature/dircommon/dir_connection_st.h"
 #include "feature/nodelist/authority_cert_st.h"
 #include "feature/nodelist/extrainfo_st.h"
+#include "feature/nodelist/networkstatus_st.h"
 #include "feature/nodelist/node_st.h"
 #include "feature/nodelist/routerinfo_st.h"
 #include "feature/nodelist/routerstatus_st.h"
@@ -130,6 +138,18 @@ static authority_cert_t *legacy_key_certificate = NULL;
  * used by tor-gencert to sign new signing keys and make new key
  * certificates. */
 
+/** Indicate if the IPv6 address should be omitted from the descriptor when
+ * publishing it. This can happen if the IPv4 is reachable but the
+ * auto-discovered IPv6 is not. We still publish the descriptor.
+ *
+ * Only relays should look at this and only for their descriptor.
+ *
+ * XXX: The real harder fix is to never put in the routerinfo_t a non
+ * reachable address and instead use the last resolved address cache to do
+ * reachability test or anything that has to do with what address tor thinks
+ * it has. */
+static bool omit_ipv6_on_publish = false;
+
 /** Return a readonly string with human readable description
  * of <b>err</b>.
  */
@@ -149,6 +169,8 @@ routerinfo_err_to_string(int err)
       return "Cannot generate descriptor";
     case TOR_ROUTERINFO_ERROR_DESC_REBUILDING:
       return "Descriptor still rebuilding - not ready yet";
+    case TOR_ROUTERINFO_ERROR_INTERNAL_BUG:
+      return "Internal bug, see logs for details";
   }
 
   log_warn(LD_BUG, "unknown routerinfo error %d - shouldn't happen", err);
@@ -166,7 +188,7 @@ routerinfo_err_is_transient(int err)
   /**
    * For simplicity, we consider all errors other than
    * "not a server" transient - see discussion on
-   * https://trac.torproject.org/projects/tor/ticket/27034
+   * https://bugs.torproject.org/tpo/core/tor/27034.
    */
   return err != TOR_ROUTERINFO_ERROR_NOT_A_SERVER;
 }
@@ -191,8 +213,8 @@ set_onion_key(crypto_pk_t *k)
 
 /** Return the current onion key.  Requires that the onion key has been
  * loaded or generated. */
-crypto_pk_t *
-get_onion_key(void)
+MOCK_IMPL(crypto_pk_t *,
+get_onion_key,(void))
 {
   tor_assert(onionkey);
   return onionkey;
@@ -239,7 +261,7 @@ expire_old_onion_keys(void)
     lastonionkey = NULL;
   }
 
-  /* We zero out the keypair. See the tor_mem_is_zero() check made in
+  /* We zero out the keypair. See the fast_mem_is_zero() check made in
    * construct_ntor_key_map() below. */
   memset(&last_curve25519_onion_key, 0, sizeof(last_curve25519_onion_key));
 
@@ -266,11 +288,12 @@ expire_old_onion_keys(void)
 
 /** Return the current secret onion key for the ntor handshake. Must only
  * be called from the main thread. */
-static const curve25519_keypair_t *
-get_current_curve25519_keypair(void)
+MOCK_IMPL(STATIC const struct curve25519_keypair_t *,
+get_current_curve25519_keypair,(void))
 {
   return &curve25519_onion_key;
 }
+
 /** Return a map from KEYID (the key itself) to keypairs for use in the ntor
  * handshake. Must only be called from the main thread. */
 di_digest256_map_t *
@@ -281,12 +304,12 @@ construct_ntor_key_map(void)
   const uint8_t *cur_pk = curve25519_onion_key.pubkey.public_key;
   const uint8_t *last_pk = last_curve25519_onion_key.pubkey.public_key;
 
-  if (!tor_mem_is_zero((const char *)cur_pk, CURVE25519_PUBKEY_LEN)) {
+  if (!fast_mem_is_zero((const char *)cur_pk, CURVE25519_PUBKEY_LEN)) {
     dimap_add_entry(&m, cur_pk,
                     tor_memdup(&curve25519_onion_key,
                                sizeof(curve25519_keypair_t)));
   }
-  if (!tor_mem_is_zero((const char*)last_pk, CURVE25519_PUBKEY_LEN) &&
+  if (!fast_mem_is_zero((const char*)last_pk, CURVE25519_PUBKEY_LEN) &&
       tor_memneq(cur_pk, last_pk, CURVE25519_PUBKEY_LEN)) {
     dimap_add_entry(&m, last_pk,
                     tor_memdup(&last_curve25519_onion_key,
@@ -337,6 +360,16 @@ set_server_identity_key(crypto_pk_t *k)
   }
 }
 
+#ifdef TOR_UNIT_TESTS
+/** Testing only -- set the server's RSA identity digest to
+ * be <b>digest</b> */
+void
+set_server_identity_key_digest_testing(const uint8_t *digest)
+{
+  memcpy(server_identitykey_digest, digest, DIGEST_LEN);
+}
+#endif /* defined(TOR_UNIT_TESTS) */
+
 /** Make sure that we have set up our identity keys to match or not match as
  * appropriate, and die with an assertion if we have not. */
 static void
@@ -356,24 +389,31 @@ assert_identity_keys_ok(void)
   }
 }
 
+#ifdef HAVE_MODULE_RELAY
+
 /** Returns the current server identity key; requires that the key has
  * been set, and that we are running as a Tor server.
  */
-crypto_pk_t *
-get_server_identity_key(void)
+MOCK_IMPL(crypto_pk_t *,
+get_server_identity_key,(void))
 {
   tor_assert(server_identitykey);
-  tor_assert(server_mode(get_options()));
+  tor_assert(server_mode(get_options()) ||
+             get_options()->command == CMD_KEY_EXPIRATION);
   assert_identity_keys_ok();
   return server_identitykey;
 }
+
+#endif /* defined(HAVE_MODULE_RELAY) */
 
 /** Return true iff we are a server and the server identity key
  * has been set. */
 int
 server_identity_key_is_set(void)
 {
-  return server_mode(get_options()) && server_identitykey != NULL;
+  return (server_mode(get_options()) ||
+          get_options()->command == CMD_KEY_EXPIRATION) &&
+         server_identitykey != NULL;
 }
 
 /** Set the current client identity key to <b>k</b>.
@@ -634,7 +674,7 @@ load_authority_keyset(int legacy, crypto_pk_t **key_out,
                fname);
     goto done;
   }
-  parsed = authority_cert_parse_from_string(cert, &eos);
+  parsed = authority_cert_parse_from_string(cert, strlen(cert), &eos);
   if (!parsed) {
     log_warn(LD_DIR, "Unable to parse certificate in %s", fname);
     goto done;
@@ -727,8 +767,8 @@ v3_authority_check_key_expiry(void)
 }
 
 /** Get the lifetime of an onion key in days. This value is defined by the
- * network consesus parameter "onion-key-rotation-days". Always returns a value
- * between <b>MIN_ONION_KEY_LIFETIME_DAYS</b> and
+ * network consensus parameter "onion-key-rotation-days". Always returns a
+ * value between <b>MIN_ONION_KEY_LIFETIME_DAYS</b> and
  * <b>MAX_ONION_KEY_LIFETIME_DAYS</b>.
  */
 static int
@@ -742,7 +782,7 @@ get_onion_key_rotation_days_(void)
 }
 
 /** Get the current lifetime of an onion key in seconds. This value is defined
- * by the network consesus parameter "onion-key-rotation-days", but the value
+ * by the network consensus parameter "onion-key-rotation-days", but the value
  * is converted to seconds.
  */
 int
@@ -752,7 +792,7 @@ get_onion_key_lifetime(void)
 }
 
 /** Get the grace period of an onion key in seconds. This value is defined by
- * the network consesus parameter "onion-key-grace-period-days", but the value
+ * the network consensus parameter "onion-key-grace-period-days", but the value
  * is converted to seconds.
  */
 int
@@ -803,58 +843,81 @@ router_initialize_tls_context(void)
                               (unsigned int)lifetime);
 }
 
+/** Announce URL to bridge status page. */
+STATIC void
+router_announce_bridge_status_page(void)
+{
+  char fingerprint[FINGERPRINT_LEN + 1];
+
+  if (crypto_pk_get_hashed_fingerprint(get_server_identity_key(),
+                                       fingerprint) < 0) {
+    // LCOV_EXCL_START
+    log_err(LD_GENERAL, "Unable to compute bridge fingerprint");
+    return;
+    // LCOV_EXCL_STOP
+  }
+
+  log_notice(LD_GENERAL, "You can check the status of your bridge relay at "
+                         "https://bridges.torproject.org/status?id=%s",
+                         fingerprint);
+}
+
 /** Compute fingerprint (or hashed fingerprint if hashed is 1) and write
  * it to 'fingerprint' (or 'hashed-fingerprint'). Return 0 on success, or
  * -1 if Tor should die,
  */
 STATIC int
-router_write_fingerprint(int hashed)
+router_write_fingerprint(int hashed, int ed25519_identity)
 {
-  char *keydir = NULL, *cp = NULL;
+  char *keydir = NULL;
   const char *fname = hashed ? "hashed-fingerprint" :
-                               "fingerprint";
+                      (ed25519_identity ? "fingerprint-ed25519" :
+                                          "fingerprint");
   char fingerprint[FINGERPRINT_LEN+1];
   const or_options_t *options = get_options();
   char *fingerprint_line = NULL;
   int result = -1;
 
   keydir = get_datadir_fname(fname);
-  log_info(LD_GENERAL,"Dumping %sfingerprint to \"%s\"...",
-           hashed ? "hashed " : "", keydir);
-  if (!hashed) {
-    if (crypto_pk_get_fingerprint(get_server_identity_key(),
-                                  fingerprint, 0) < 0) {
-      log_err(LD_GENERAL,"Error computing fingerprint");
-      goto done;
-    }
-  } else {
-    if (crypto_pk_get_hashed_fingerprint(get_server_identity_key(),
-                                         fingerprint) < 0) {
-      log_err(LD_GENERAL,"Error computing hashed fingerprint");
-      goto done;
+  log_info(LD_GENERAL,"Dumping %s%s to \"%s\"...", hashed ? "hashed " : "",
+           ed25519_identity ? "ed25519 identity" : "fingerprint", keydir);
+
+  if (ed25519_identity) { /* ed25519 identity */
+    digest256_to_base64(fingerprint, (const char *)
+                                     get_master_identity_key()->pubkey);
+  } else { /* RSA identity */
+    if (!hashed) {
+      if (crypto_pk_get_fingerprint(get_server_identity_key(),
+                                    fingerprint, 0) < 0) {
+        log_err(LD_GENERAL,"Error computing fingerprint");
+        goto done;
+      }
+    } else {
+      if (crypto_pk_get_hashed_fingerprint(get_server_identity_key(),
+                                           fingerprint) < 0) {
+        log_err(LD_GENERAL,"Error computing hashed fingerprint");
+        goto done;
+      }
     }
   }
 
   tor_asprintf(&fingerprint_line, "%s %s\n", options->Nickname, fingerprint);
 
   /* Check whether we need to write the (hashed-)fingerprint file. */
-
-  cp = read_file_to_str(keydir, RFTS_IGNORE_MISSING, NULL);
-  if (!cp || strcmp(cp, fingerprint_line)) {
-    if (write_str_to_file(keydir, fingerprint_line, 0)) {
-      log_err(LD_FS, "Error writing %sfingerprint line to file",
-              hashed ? "hashed " : "");
-      goto done;
-    }
+  if (write_str_to_file_if_not_equal(keydir, fingerprint_line)) {
+    log_err(LD_FS, "Error writing %s%s line to file",
+            hashed ? "hashed " : "",
+            ed25519_identity ? "ed25519 identity" : "fingerprint");
+    goto done;
   }
 
-  log_notice(LD_GENERAL, "Your Tor %s identity key fingerprint is '%s %s'",
-             hashed ? "bridge's hashed" : "server's", options->Nickname,
-             fingerprint);
+  log_notice(LD_GENERAL, "Your Tor %s identity key %s fingerprint is '%s %s'",
+             hashed ? "bridge's hashed" : "server's",
+             ed25519_identity ? "ed25519" : "",
+             options->Nickname, fingerprint);
 
   result = 0;
  done:
-  tor_free(cp);
   tor_free(keydir);
   tor_free(fingerprint_line);
   return result;
@@ -865,15 +928,6 @@ init_keys_common(void)
 {
   if (!key_lock)
     key_lock = tor_mutex_new();
-
-  /* There are a couple of paths that put us here before we've asked
-   * openssl to initialize itself. */
-  if (crypto_global_init(get_options()->HardwareAccel,
-                         get_options()->AccelName,
-                         get_options()->AccelDir)) {
-    log_err(LD_BUG, "Unable to initialize OpenSSL. Exiting.");
-    return -1;
-  }
 
   return 0;
 }
@@ -921,7 +975,7 @@ init_keys(void)
 
   /* OP's don't need persistent keys; just make up an identity and
    * initialize the TLS context. */
-  if (!server_mode(options)) {
+  if (!server_mode(options) && !(options->command == CMD_KEY_EXPIRATION)) {
     return init_keys_client();
   }
   if (init_keys_common() < 0)
@@ -1031,7 +1085,7 @@ init_keys(void)
       return -1;
 
     keydir = get_keydir_fname("secret_onion_key_ntor.old");
-    if (tor_mem_is_zero((const char *)
+    if (fast_mem_is_zero((const char *)
                            last_curve25519_onion_key.pubkey.public_key,
                         CURVE25519_PUBKEY_LEN) &&
         file_status(keydir) == FN_FILE) {
@@ -1062,8 +1116,10 @@ init_keys(void)
   if (authdir_mode_v3(options)) {
     const char *m = NULL;
     routerinfo_t *ri;
-    /* We need to add our own fingerprint so it gets recognized. */
-    if (dirserv_add_own_fingerprint(get_server_identity_key())) {
+    /* We need to add our own fingerprint and ed25519 key so it gets
+     * recognized. */
+    if (dirserv_add_own_fingerprint(get_server_identity_key(),
+                                    get_master_identity_key())) {
       log_err(LD_GENERAL,"Error adding own fingerprint to set of relays");
       return -1;
     }
@@ -1093,15 +1149,24 @@ init_keys(void)
     }
   }
 
-  /* 5. Dump fingerprint and possibly hashed fingerprint to files. */
-  if (router_write_fingerprint(0)) {
+  /* 5. Dump fingerprint, ed25519 identity and possibly hashed fingerprint
+   * to files. */
+  if (router_write_fingerprint(0, 0)) {
     log_err(LD_FS, "Error writing fingerprint to file");
     return -1;
   }
-  if (!public_server_mode(options) && router_write_fingerprint(1)) {
+  if (!public_server_mode(options) && router_write_fingerprint(1, 0)) {
     log_err(LD_FS, "Error writing hashed fingerprint to file");
     return -1;
   }
+  if (router_write_fingerprint(0, 1)) {
+    log_err(LD_FS, "Error writing ed25519 identity to file");
+    return -1;
+  }
+
+  /* Display URL to bridge status page. */
+  if (! public_server_mode(options))
+    router_announce_bridge_status_page();
 
   if (!authdir_mode(options))
     return 0;
@@ -1118,10 +1183,12 @@ init_keys(void)
 
   ds = router_get_trusteddirserver_by_digest(digest);
   if (!ds) {
+    tor_addr_port_t ipv6_orport;
+    routerconf_find_ipv6_or_ap(options, &ipv6_orport);
     ds = trusted_dir_server_new(options->Nickname, NULL,
-                                router_get_advertised_dir_port(options, 0),
-                                router_get_advertised_or_port(options),
-                                NULL,
+                                routerconf_find_dir_port(options, 0),
+                                routerconf_find_or_port(options,AF_INET),
+                                &ipv6_orport,
                                 digest,
                                 v3_digest,
                                 type, 0.0);
@@ -1202,7 +1269,7 @@ router_should_be_dirserver(const or_options_t *options, int dir_port)
      * much larger effect on output than input so there is no reason to turn it
      * off if using AccountingRule in. */
     int interval_length = accounting_get_interval_length();
-    uint32_t effective_bw = get_effective_bwrate(options);
+    uint32_t effective_bw = relay_get_effective_bwrate(options);
     uint64_t acc_bytes;
     if (!interval_length) {
       log_warn(LD_BUG, "An accounting interval is not allowed to be zero "
@@ -1272,10 +1339,10 @@ decide_to_advertise_dir_impl(const or_options_t *options,
     return 1;
   if (net_is_disabled())
     return 0;
-  if (dir_port && !router_get_advertised_dir_port(options, dir_port))
+  if (dir_port && !routerconf_find_dir_port(options, dir_port))
     return 0;
   if (supports_tunnelled_dir_requests &&
-      !router_get_advertised_or_port(options))
+      !routerconf_find_or_port(options, AF_INET))
     return 0;
 
   /* Part two: consider config options that could make us choose to
@@ -1290,8 +1357,8 @@ decide_to_advertise_dir_impl(const or_options_t *options,
 int
 router_should_advertise_dirport(const or_options_t *options, uint16_t dir_port)
 {
-  /* supports_tunnelled_dir_requests is not relevant, pass 0 */
-  return decide_to_advertise_dir_impl(options, dir_port, 0) ? dir_port : 0;
+  /* Only authorities should advertise a DirPort now. */
+  return authdir_mode(options) ? dir_port : 0;
 }
 
 /** Front-end to decide_to_advertise_dir_impl(): return 0 if we don't want to
@@ -1319,6 +1386,17 @@ should_refuse_unknown_exits(const or_options_t *options)
   }
 }
 
+/**
+ * If true, then we will publish our descriptor even if our own IPv4 ORPort
+ * seems to be unreachable.
+ **/
+static bool publish_even_when_ipv4_orport_unreachable = false;
+/**
+ * If true, then we will publish our descriptor even if our own IPv6 ORPort
+ * seems to be unreachable.
+ **/
+static bool publish_even_when_ipv6_orport_unreachable = false;
+
 /** Decide if we're a publishable server. We are a publishable server if:
  * - We don't have the ClientOnly option set
  * and
@@ -1345,16 +1423,30 @@ decide_if_publishable_server(void)
     return 0;
   if (authdir_mode(options))
     return 1;
-  if (!router_get_advertised_or_port(options))
+  if (!routerconf_find_or_port(options, AF_INET))
     return 0;
-  if (!check_whether_orport_reachable(options))
-    return 0;
+  if (!router_orport_seems_reachable(options, AF_INET)) {
+    // We have an ipv4 orport, and it doesn't seem reachable.
+    if (!publish_even_when_ipv4_orport_unreachable) {
+      return 0;
+    }
+  }
+  /* We could be flagged to omit the IPv6 and if so, don't check for
+   * reachability on the IPv6. This can happen if the address was
+   * auto-discovered but turns out to be non reachable. */
+  if (!omit_ipv6_on_publish &&
+      !router_orport_seems_reachable(options, AF_INET6)) {
+    // We have an ipv6 orport, and it doesn't seem reachable.
+    if (!publish_even_when_ipv6_orport_unreachable) {
+      return 0;
+    }
+  }
   if (router_have_consensus_path() == CONSENSUS_PATH_INTERNAL) {
     /* All set: there are no exits in the consensus (maybe this is a tiny
      * test network), so we can't check our DirPort reachability. */
     return 1;
   } else {
-    return check_whether_dirport_reachable(options);
+    return router_dirport_seems_reachable(options);
   }
 }
 
@@ -1374,17 +1466,16 @@ consider_publishable_server(int force)
     return;
 
   rebuilt = router_rebuild_descriptor(0);
-  if (decide_if_publishable_server()) {
+  if (rebuilt && decide_if_publishable_server()) {
     set_server_advertised(1);
-    if (rebuilt == 0)
-      router_upload_dir_desc_to_dirservers(force);
+    router_upload_dir_desc_to_dirservers(force);
   } else {
     set_server_advertised(0);
   }
 }
 
 /** Return the port of the first active listener of type
- *  <b>listener_type</b>. */
+ *  <b>listener_type</b>. Returns 0 if no port is found. */
 /** XXX not a very good interface. it's not reliable when there are
     multiple listeners. */
 uint16_t
@@ -1404,23 +1495,14 @@ router_get_active_listener_port_by_type_af(int listener_type,
   return 0;
 }
 
-/** Return the port that we should advertise as our ORPort; this is either
- * the one configured in the ORPort option, or the one we actually bound to
- * if ORPort is "auto".
- */
+/** Return the port that we should advertise as our ORPort in a given address
+ * family; this is either the one configured in the ORPort option, or the one
+ * we actually bound to if ORPort is "auto". Returns 0 if no port is found. */
 uint16_t
-router_get_advertised_or_port(const or_options_t *options)
+routerconf_find_or_port(const or_options_t *options,
+                              sa_family_t family)
 {
-  return router_get_advertised_or_port_by_af(options, AF_INET);
-}
-
-/** As router_get_advertised_or_port(), but allows an address family argument.
- */
-uint16_t
-router_get_advertised_or_port_by_af(const or_options_t *options,
-                                    sa_family_t family)
-{
-  int port = get_first_advertised_port_by_type_af(CONN_TYPE_OR_LISTENER,
+  int port = portconf_get_first_advertised_port(CONN_TYPE_OR_LISTENER,
                                                   family);
   (void)options;
 
@@ -1433,11 +1515,11 @@ router_get_advertised_or_port_by_af(const or_options_t *options,
   return port;
 }
 
-/** As router_get_advertised_or_port(), but returns the IPv6 address and
+/** As routerconf_find_or_port(), but returns the IPv6 address and
  *  port in ipv6_ap_out, which must not be NULL. Returns a null address and
  * zero port, if no ORPort is found. */
 void
-router_get_advertised_ipv6_or_ap(const or_options_t *options,
+routerconf_find_ipv6_or_ap(const or_options_t *options,
                                  tor_addr_port_t *ipv6_ap_out)
 {
   /* Bug in calling function, we can't return a sensible result, and it
@@ -1448,15 +1530,14 @@ router_get_advertised_ipv6_or_ap(const or_options_t *options,
   tor_addr_make_null(&ipv6_ap_out->addr, AF_INET6);
   ipv6_ap_out->port = 0;
 
-  const tor_addr_t *addr = get_first_advertised_addr_by_type_af(
+  const tor_addr_t *addr = portconf_get_first_advertised_addr(
                                                       CONN_TYPE_OR_LISTENER,
                                                       AF_INET6);
-  const uint16_t port = router_get_advertised_or_port_by_af(
-                                                      options,
+  const uint16_t port = routerconf_find_or_port(options,
                                                       AF_INET6);
 
   if (!addr || port == 0) {
-    log_info(LD_CONFIG, "There is no advertised IPv6 ORPort.");
+    log_debug(LD_CONFIG, "There is no advertised IPv6 ORPort.");
     return;
   }
 
@@ -1477,15 +1558,55 @@ router_get_advertised_ipv6_or_ap(const or_options_t *options,
   ipv6_ap_out->port = port;
 }
 
+/** Returns true if this router has an advertised IPv6 ORPort. */
+bool
+routerconf_has_ipv6_orport(const or_options_t *options)
+{
+  /* What we want here is to learn if we have configured an IPv6 ORPort.
+   * Remember, ORPort can listen on [::] and thus consider internal by
+   * router_get_advertised_ipv6_or_ap() since we do _not_ want to advertise
+   * such address. */
+  const tor_addr_t *addr =
+    portconf_get_first_advertised_addr(CONN_TYPE_OR_LISTENER, AF_INET6);
+  const uint16_t port =
+    routerconf_find_or_port(options, AF_INET6);
+
+  return tor_addr_port_is_valid(addr, port, 1);
+}
+
+/** Returns true if this router can extend over IPv6.
+ *
+ * This check should only be performed by relay extend code.
+ *
+ * Clients should check if relays can initiate and accept IPv6 extends using
+ * node_supports_initiating_ipv6_extends() and
+ * node_supports_accepting_ipv6_extends().
+ *
+ * As with other extends, relays should assume the client has already
+ * performed the relevant checks for the next hop. (Otherwise, relays that
+ * have just added IPv6 ORPorts won't be able to self-test those ORPorts.)
+ *
+ * Accepting relays don't need to perform any IPv6-specific checks before
+ * accepting a connection, because having an IPv6 ORPort implies support for
+ * the relevant protocol version.
+ */
+MOCK_IMPL(bool,
+router_can_extend_over_ipv6,(const or_options_t *options))
+{
+  /* We might add some extra checks here, such as ExtendAllowIPv6Addresses
+  * from ticket 33818. */
+  return routerconf_has_ipv6_orport(options);
+}
+
 /** Return the port that we should advertise as our DirPort;
  * this is one of three possibilities:
  * The one that is passed as <b>dirport</b> if the DirPort option is 0, or
  * the one configured in the DirPort option,
  * or the one we actually bound to if DirPort is "auto". */
 uint16_t
-router_get_advertised_dir_port(const or_options_t *options, uint16_t dirport)
+routerconf_find_dir_port(const or_options_t *options, uint16_t dirport)
 {
-  int dirport_configured = get_primary_dir_port();
+  int dirport_configured = portconf_get_primary_dir_port();
   (void)options;
 
   if (!dirport_configured)
@@ -1511,9 +1632,9 @@ static extrainfo_t *desc_extrainfo = NULL;
 static const char *desc_gen_reason = "uninitialized reason";
 /** Since when has our descriptor been "clean"?  0 if we need to regenerate it
  * now. */
-static time_t desc_clean_since = 0;
+STATIC time_t desc_clean_since = 0;
 /** Why did we mark the descriptor dirty? */
-static const char *desc_dirty_reason = "Tor just started";
+STATIC const char *desc_dirty_reason = "Tor just started";
 /** Boolean: do we need to regenerate the above? */
 static int desc_needs_upload = 0;
 
@@ -1649,6 +1770,31 @@ router_is_me(const routerinfo_t *router)
   return router_digest_is_me(router->cache_info.identity_digest);
 }
 
+/**
+ * Return true if we are a server, and if @a addr is an address we are
+ * currently publishing (or trying to publish) in our descriptor.
+ * Return false otherwise.
+ **/
+bool
+router_addr_is_my_published_addr(const tor_addr_t *addr)
+{
+  IF_BUG_ONCE(!addr)
+    return false;
+
+  const routerinfo_t *me = router_get_my_routerinfo();
+  if (!me)
+    return false;
+
+  switch (tor_addr_family(addr)) {
+  case AF_INET:
+    return tor_addr_eq(addr, &me->ipv4_addr);
+  case AF_INET6:
+    return tor_addr_eq(addr, &me->ipv6_addr);
+  default:
+    return false;
+  }
+}
+
 /** Return a routerinfo for this OR, rebuilding a fresh one if
  * necessary.  Return NULL on error, or if called on an OP. */
 MOCK_IMPL(const routerinfo_t *,
@@ -1669,16 +1815,6 @@ router_get_my_routerinfo_with_err,(int *err))
       *err = TOR_ROUTERINFO_ERROR_NOT_A_SERVER;
 
     return NULL;
-  }
-
-  if (!desc_clean_since) {
-    int rebuild_err = router_rebuild_descriptor(0);
-    if (rebuild_err < 0) {
-      if (err)
-        *err = rebuild_err;
-
-      return NULL;
-    }
   }
 
   if (!desc_routerinfo) {
@@ -1719,7 +1855,7 @@ router_get_my_extrainfo(void)
 {
   if (!server_mode(get_options()))
     return NULL;
-  if (router_rebuild_descriptor(0))
+  if (!router_rebuild_descriptor(0))
     return NULL;
   return desc_extrainfo;
 }
@@ -1732,97 +1868,59 @@ router_get_descriptor_gen_reason(void)
   return desc_gen_reason;
 }
 
-/** A list of nicknames that we've warned about including in our family
- * declaration verbatim rather than as digests. */
-static smartlist_t *warned_nonexistent_family = NULL;
-
-static int router_guess_address_from_dir_headers(uint32_t *guess);
-
-/** Make a current best guess at our address, either because
- * it's configured in torrc, or because we've learned it from
- * dirserver headers. Place the answer in *<b>addr</b> and return
- * 0 on success, else return -1 if we have no guess.
- *
- * If <b>cache_only</b> is true, just return any cached answers, and
- * don't try to get any new answers.
- */
-MOCK_IMPL(int,
-router_pick_published_address,(const or_options_t *options, uint32_t *addr,
-                               int cache_only))
-{
-  /* First, check the cached output from resolve_my_address(). */
-  *addr = get_last_resolved_addr();
-  if (*addr)
-    return 0;
-
-  /* Second, consider doing a resolve attempt right here. */
-  if (!cache_only) {
-    if (resolve_my_address(LOG_INFO, options, addr, NULL, NULL) >= 0) {
-      log_info(LD_CONFIG,"Success: chose address '%s'.", fmt_addr32(*addr));
-      return 0;
-    }
-  }
-
-  /* Third, check the cached output from router_new_address_suggestion(). */
-  if (router_guess_address_from_dir_headers(addr) >= 0)
-    return 0;
-
-  /* We have no useful cached answers. Return failure. */
-  return -1;
-}
-
 /* Like router_check_descriptor_address_consistency, but specifically for the
  * ORPort or DirPort.
  * listener_type is either CONN_TYPE_OR_LISTENER or CONN_TYPE_DIR_LISTENER. */
 static void
-router_check_descriptor_address_port_consistency(uint32_t ipv4h_desc_addr,
+router_check_descriptor_address_port_consistency(const tor_addr_t *addr,
                                                  int listener_type)
 {
+  int family, port_cfg;
+
+  tor_assert(addr);
   tor_assert(listener_type == CONN_TYPE_OR_LISTENER ||
              listener_type == CONN_TYPE_DIR_LISTENER);
 
-  /* The first advertised Port may be the magic constant CFG_AUTO_PORT.
-   */
-  int port_v4_cfg = get_first_advertised_port_by_type_af(listener_type,
-                                                         AF_INET);
-  if (port_v4_cfg != 0 &&
-      !port_exists_by_type_addr32h_port(listener_type,
-                                        ipv4h_desc_addr, port_v4_cfg, 1)) {
-        const tor_addr_t *port_addr = get_first_advertised_addr_by_type_af(
-                                                                listener_type,
-                                                                AF_INET);
-        /* If we're building a descriptor with no advertised address,
-         * something is terribly wrong. */
-        tor_assert(port_addr);
+  family = tor_addr_family(addr);
+  /* The first advertised Port may be the magic constant CFG_AUTO_PORT. */
+  port_cfg = portconf_get_first_advertised_port(listener_type, family);
+  if (port_cfg != 0 &&
+      !port_exists_by_type_addr_port(listener_type, addr, port_cfg, 1)) {
+    const tor_addr_t *port_addr =
+      portconf_get_first_advertised_addr(listener_type, family);
+    /* If we're building a descriptor with no advertised address,
+     * something is terribly wrong. */
+    tor_assert(port_addr);
 
-        tor_addr_t desc_addr;
-        char port_addr_str[TOR_ADDR_BUF_LEN];
-        char desc_addr_str[TOR_ADDR_BUF_LEN];
+    char port_addr_str[TOR_ADDR_BUF_LEN];
+    char desc_addr_str[TOR_ADDR_BUF_LEN];
 
-        tor_addr_to_str(port_addr_str, port_addr, TOR_ADDR_BUF_LEN, 0);
+    tor_addr_to_str(port_addr_str, port_addr, TOR_ADDR_BUF_LEN, 0);
+    tor_addr_to_str(desc_addr_str, addr, TOR_ADDR_BUF_LEN, 0);
 
-        tor_addr_from_ipv4h(&desc_addr, ipv4h_desc_addr);
-        tor_addr_to_str(desc_addr_str, &desc_addr, TOR_ADDR_BUF_LEN, 0);
-
-        const char *listener_str = (listener_type == CONN_TYPE_OR_LISTENER ?
-                                    "OR" : "Dir");
-        log_warn(LD_CONFIG, "The IPv4 %sPort address %s does not match the "
-                 "descriptor address %s. If you have a static public IPv4 "
-                 "address, use 'Address <IPv4>' and 'OutboundBindAddress "
-                 "<IPv4>'. If you are behind a NAT, use two %sPort lines: "
-                 "'%sPort <PublicPort> NoListen' and '%sPort <InternalPort> "
-                 "NoAdvertise'.",
-                 listener_str, port_addr_str, desc_addr_str, listener_str,
-                 listener_str, listener_str);
-      }
+    const char *listener_str = (listener_type == CONN_TYPE_OR_LISTENER ?
+                                "OR" : "Dir");
+    const char *af_str = fmt_af_family(family);
+    log_warn(LD_CONFIG, "The %s %sPort address %s does not match the "
+             "descriptor address %s. If you have a static public IPv4 "
+             "address, use 'Address <%s>' and 'OutboundBindAddress "
+             "<%s>'. If you are behind a NAT, use two %sPort lines: "
+             "'%sPort <PublicPort> NoListen' and '%sPort <InternalPort> "
+             "NoAdvertise'.",
+             af_str, listener_str, port_addr_str, desc_addr_str, af_str,
+             af_str, listener_str, listener_str, listener_str);
+  }
 }
 
-/* Tor relays only have one IPv4 address in the descriptor, which is derived
- * from the Address torrc option, or guessed using various methods in
- * router_pick_published_address().
- * Warn the operator if there is no ORPort on the descriptor address
- * ipv4h_desc_addr.
+/** Tor relays only have one IPv4 or/and one IPv6 address in the descriptor,
+ * which is derived from the Address torrc option, or guessed using various
+ * methods in relay_find_addr_to_publish().
+ *
+ * Warn the operator if there is no ORPort associated with the given address
+ * in addr.
+ *
  * Warn the operator if there is no DirPort on the descriptor address.
+ *
  * This catches a few common config errors:
  *  - operators who expect ORPorts and DirPorts to be advertised on the
  *    ports' listen addresses, rather than the torrc Address (or guessed
@@ -1831,55 +1929,207 @@ router_check_descriptor_address_port_consistency(uint32_t ipv4h_desc_addr,
  *    addresses;
  *  - discrepancies between guessed addresses and configured listen
  *    addresses (when the Address option isn't set).
+ *
  * If a listener is listening on all IPv4 addresses, it is assumed that it
  * is listening on the configured Address, and no messages are logged.
+ *
  * If an operators has specified NoAdvertise ORPorts in a NAT setting,
  * no messages are logged, unless they have specified other advertised
  * addresses.
+ *
  * The message tells operators to configure an ORPort and DirPort that match
- * the Address (using NoListen if needed).
- */
+ * the Address (using NoListen if needed). */
 static void
-router_check_descriptor_address_consistency(uint32_t ipv4h_desc_addr)
+router_check_descriptor_address_consistency(const tor_addr_t *addr)
 {
-  router_check_descriptor_address_port_consistency(ipv4h_desc_addr,
+  router_check_descriptor_address_port_consistency(addr,
                                                    CONN_TYPE_OR_LISTENER);
-  router_check_descriptor_address_port_consistency(ipv4h_desc_addr,
+  router_check_descriptor_address_port_consistency(addr,
                                                    CONN_TYPE_DIR_LISTENER);
 }
 
-/** Build a fresh routerinfo, signed server descriptor, and extra-info document
- * for this OR. Set r to the generated routerinfo, e to the generated
- * extra-info document. Return 0 on success, -1 on temporary error. Failure to
- * generate an extra-info document is not an error and is indicated by setting
- * e to NULL. Caller is responsible for freeing generated documents if 0 is
- * returned.
- */
-int
-router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
+/** A list of nicknames that we've warned about including in our family,
+ * for one reason or another. */
+static smartlist_t *warned_family = NULL;
+
+/**
+ * Return a new smartlist containing the family members configured in
+ * <b>options</b>.  Warn about invalid or missing entries.  Return NULL
+ * if this relay should not declare a family.
+ **/
+STATIC smartlist_t *
+get_my_declared_family(const or_options_t *options)
 {
-  routerinfo_t *ri;
-  extrainfo_t *ei;
-  uint32_t addr;
+  if (!options->MyFamily)
+    return NULL;
+
+  if (options->BridgeRelay)
+    return NULL;
+
+  if (!warned_family)
+    warned_family = smartlist_new();
+
+  smartlist_t *declared_family = smartlist_new();
+  config_line_t *family;
+
+  /* First we try to get the whole family in the form of hexdigests. */
+  for (family = options->MyFamily; family; family = family->next) {
+    char *name = family->value;
+    const node_t *member;
+    if (options->Nickname && !strcasecmp(name, options->Nickname))
+      continue; /* Don't list ourself by nickname, that's redundant */
+    else
+      member = node_get_by_nickname(name, 0);
+
+    if (!member) {
+      /* This node doesn't seem to exist, so warn about it if it is not
+       * a hexdigest. */
+      int is_legal = is_legal_nickname_or_hexdigest(name);
+      if (!smartlist_contains_string(warned_family, name) &&
+          !is_legal_hexdigest(name)) {
+        if (is_legal)
+          log_warn(LD_CONFIG,
+                   "There is a router named %s in my declared family, but "
+                   "I have no descriptor for it. I'll use the nickname "
+                   "as is, but this may confuse clients. Please list it "
+                   "by identity digest instead.", escaped(name));
+        else
+          log_warn(LD_CONFIG, "There is a router named %s in my declared "
+                   "family, but that isn't a legal digest or nickname. "
+                   "Skipping it.", escaped(name));
+        smartlist_add_strdup(warned_family, name);
+      }
+      if (is_legal) {
+        smartlist_add_strdup(declared_family, name);
+      }
+    } else {
+      /* List the node by digest. */
+      char *fp = tor_malloc(HEX_DIGEST_LEN+2);
+      fp[0] = '$';
+      base16_encode(fp+1,HEX_DIGEST_LEN+1,
+                    member->identity, DIGEST_LEN);
+      smartlist_add(declared_family, fp);
+
+      if (! is_legal_hexdigest(name) &&
+          !smartlist_contains_string(warned_family, name)) {
+        /* Warn if this node was not specified by hexdigest. */
+        log_warn(LD_CONFIG, "There is a router named %s in my declared "
+                 "family, but it wasn't listed by digest. Please consider "
+                 "saying %s instead, if that's what you meant.",
+                 escaped(name), fp);
+        smartlist_add_strdup(warned_family, name);
+      }
+    }
+  }
+
+  /* Now declared_family should have the closest we can come to the
+   * identities that the user wanted.
+   *
+   * Unlike older versions of Tor, we _do_ include our own identity: this
+   * helps microdescriptor compression, and helps in-memory compression
+   * on clients. */
+  nodefamily_t *nf = nodefamily_from_members(declared_family,
+                                     router_get_my_id_digest(),
+                                     NF_WARN_MALFORMED,
+                                     NULL);
+  SMARTLIST_FOREACH(declared_family, char *, s, tor_free(s));
+  smartlist_free(declared_family);
+  if (!nf) {
+    return NULL;
+  }
+
+  char *s = nodefamily_format(nf);
+  nodefamily_free(nf);
+
+  smartlist_t *result = smartlist_new();
+  smartlist_split_string(result, s, NULL,
+                         SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
+  tor_free(s);
+
+  if (smartlist_len(result) == 1) {
+    /* This is a one-element list containing only ourself; instead return
+     * nothing */
+    const char *singleton = smartlist_get(result, 0);
+    bool is_me = false;
+    if (singleton[0] == '$') {
+      char d[DIGEST_LEN];
+      int n = base16_decode(d, sizeof(d), singleton+1, strlen(singleton+1));
+      if (n == DIGEST_LEN &&
+          fast_memeq(d, router_get_my_id_digest(), DIGEST_LEN)) {
+        is_me = true;
+      }
+    }
+    if (!is_me) {
+      // LCOV_EXCL_START
+      log_warn(LD_BUG, "Found a singleton family list with an element "
+               "that wasn't us! Element was %s", escaped(singleton));
+      // LCOV_EXCL_STOP
+    } else {
+      SMARTLIST_FOREACH(result, char *, cp, tor_free(cp));
+      smartlist_free(result);
+      return NULL;
+    }
+  }
+
+  return result;
+}
+
+/** Allocate a fresh, unsigned routerinfo for this OR, without any of the
+ * fields that depend on the corresponding extrainfo.
+ *
+ * On success, set ri_out to the new routerinfo, and return 0.
+ * Caller is responsible for freeing the generated routerinfo.
+ *
+ * Returns a negative value and sets ri_out to NULL on temporary error.
+ */
+MOCK_IMPL(STATIC int,
+router_build_fresh_unsigned_routerinfo,(routerinfo_t **ri_out))
+{
+  routerinfo_t *ri = NULL;
+  tor_addr_t ipv4_addr;
   char platform[256];
   int hibernating = we_are_hibernating();
   const or_options_t *options = get_options();
+  int result = TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
 
-  if (router_pick_published_address(options, &addr, 0) < 0) {
-    log_warn(LD_CONFIG, "Don't know my address while generating descriptor");
-    return TOR_ROUTERINFO_ERROR_NO_EXT_ADDR;
+  if (BUG(!ri_out)) {
+    result = TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
+    goto err;
   }
 
+  /* Find our resolved address both IPv4 and IPv6. In case the address is not
+   * found, the object is set to an UNSPEC address. */
+  bool have_v4 = relay_find_addr_to_publish(options, AF_INET,
+                                            RELAY_FIND_ADDR_NO_FLAG,
+                                            &ipv4_addr);
+  /* Tor requires a relay to have an IPv4 so bail if we can't find it. */
+  if (!have_v4) {
+    log_info(LD_CONFIG, "Don't know my address while generating descriptor. "
+                        "Launching circuit to authority to learn it.");
+    relay_addr_learn_from_dirauth();
+    result = TOR_ROUTERINFO_ERROR_NO_EXT_ADDR;
+    goto err;
+  }
   /* Log a message if the address in the descriptor doesn't match the ORPort
    * and DirPort addresses configured by the operator. */
-  router_check_descriptor_address_consistency(addr);
+  router_check_descriptor_address_consistency(&ipv4_addr);
 
   ri = tor_malloc_zero(sizeof(routerinfo_t));
+  tor_addr_copy(&ri->ipv4_addr, &ipv4_addr);
   ri->cache_info.routerlist_index = -1;
   ri->nickname = tor_strdup(options->Nickname);
-  ri->addr = addr;
-  ri->or_port = router_get_advertised_or_port(options);
-  ri->dir_port = router_get_advertised_dir_port(options, 0);
+
+  /* IPv4. */
+  ri->ipv4_orport = routerconf_find_or_port(options, AF_INET);
+  ri->ipv4_dirport = routerconf_find_dir_port(options, 0);
+
+  /* Optionally check for an IPv6. We still publish without one. */
+  if (relay_find_addr_to_publish(options, AF_INET6, RELAY_FIND_ADDR_NO_FLAG,
+                                 &ri->ipv6_addr)) {
+    ri->ipv6_orport = routerconf_find_or_port(options, AF_INET6);
+    router_check_descriptor_address_consistency(&ri->ipv6_addr);
+  }
+
   ri->supports_tunnelled_dir_requests =
     directory_permits_begindir_requests(options);
   ri->cache_info.published_on = time(NULL);
@@ -1891,18 +2141,11 @@ router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
     tor_memdup(&get_current_curve25519_keypair()->pubkey,
                sizeof(curve25519_public_key_t));
 
-  /* For now, at most one IPv6 or-address is being advertised. */
-  tor_addr_port_t ipv6_orport;
-  router_get_advertised_ipv6_or_ap(options, &ipv6_orport);
-  /* If there is no valud IPv6 ORPort, the address and port are null. */
-  tor_addr_copy(&ri->ipv6_addr, &ipv6_orport.addr);
-  ri->ipv6_orport = ipv6_orport.port;
-
   ri->identity_pkey = crypto_pk_dup_key(get_server_identity_key());
   if (BUG(crypto_pk_get_digest(ri->identity_pkey,
                            ri->cache_info.identity_digest) < 0)) {
-    routerinfo_free(ri);
-    return TOR_ROUTERINFO_ERROR_DIGEST_FAILED;
+    result = TOR_ROUTERINFO_ERROR_DIGEST_FAILED;
+    goto err;
   }
   ri->cache_info.signing_key_cert =
     tor_cert_dup(get_master_signing_key_cert());
@@ -1913,19 +2156,20 @@ router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
   ri->protocol_list = tor_strdup(protover_get_supported_protocols());
 
   /* compute ri->bandwidthrate as the min of various options */
-  ri->bandwidthrate = get_effective_bwrate(options);
+  ri->bandwidthrate = relay_get_effective_bwrate(options);
 
   /* and compute ri->bandwidthburst similarly */
-  ri->bandwidthburst = get_effective_bwburst(options);
+  ri->bandwidthburst = relay_get_effective_bwburst(options);
 
   /* Report bandwidth, unless we're hibernating or shutting down */
-  ri->bandwidthcapacity = hibernating ? 0 : rep_hist_bandwidth_assess();
+  ri->bandwidthcapacity = hibernating ? 0 : bwhist_bandwidth_assess();
 
   if (dns_seems_to_be_broken() || has_dns_init_failed()) {
     /* DNS is screwed up; don't claim to be an exit. */
     policies_exit_policy_append_reject_star(&ri->exit_policy);
   } else {
-    policies_parse_exit_policy_from_options(options,ri->addr,&ri->ipv6_addr,
+    policies_parse_exit_policy_from_options(options, &ri->ipv4_addr,
+                                            &ri->ipv6_addr,
                                             &ri->exit_policy);
   }
   ri->policy_is_reject_star =
@@ -1939,134 +2183,260 @@ router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
     tor_free(p_tmp);
   }
 
-  if (options->MyFamily && ! options->BridgeRelay) {
-    if (!warned_nonexistent_family)
-      warned_nonexistent_family = smartlist_new();
-    ri->declared_family = smartlist_new();
-    config_line_t *family;
-    for (family = options->MyFamily; family; family = family->next) {
-       char *name = family->value;
-       const node_t *member;
-       if (!strcasecmp(name, options->Nickname))
-         continue; /* Don't list ourself, that's redundant */
-       else
-         member = node_get_by_nickname(name, 0);
-       if (!member) {
-         int is_legal = is_legal_nickname_or_hexdigest(name);
-         if (!smartlist_contains_string(warned_nonexistent_family, name) &&
-             !is_legal_hexdigest(name)) {
-           if (is_legal)
-             log_warn(LD_CONFIG,
-                      "I have no descriptor for the router named \"%s\" in my "
-                      "declared family; I'll use the nickname as is, but "
-                      "this may confuse clients.", name);
-           else
-             log_warn(LD_CONFIG, "There is a router named \"%s\" in my "
-                      "declared family, but that isn't a legal nickname. "
-                      "Skipping it.", escaped(name));
-           smartlist_add_strdup(warned_nonexistent_family, name);
-         }
-         if (is_legal) {
-           smartlist_add_strdup(ri->declared_family, name);
-         }
-       } else if (router_digest_is_me(member->identity)) {
-         /* Don't list ourself in our own family; that's redundant */
-         /* XXX shouldn't be possible */
-       } else {
-         char *fp = tor_malloc(HEX_DIGEST_LEN+2);
-         fp[0] = '$';
-         base16_encode(fp+1,HEX_DIGEST_LEN+1,
-                       member->identity, DIGEST_LEN);
-         smartlist_add(ri->declared_family, fp);
-         if (smartlist_contains_string(warned_nonexistent_family, name))
-           smartlist_string_remove(warned_nonexistent_family, name);
-       }
-    }
+  ri->declared_family = get_my_declared_family(options);
 
-    /* remove duplicates from the list */
-    smartlist_sort_strings(ri->declared_family);
-    smartlist_uniq_strings(ri->declared_family);
+  if (options->BridgeRelay) {
+    ri->purpose = ROUTER_PURPOSE_BRIDGE;
+    /* Bridges shouldn't be able to send their descriptors unencrypted,
+     anyway, since they don't have a DirPort, and always connect to the
+     bridge authority anonymously.  But just in case they somehow think of
+     sending them on an unencrypted connection, don't allow them to try. */
+    ri->cache_info.send_unencrypted = 0;
+  } else {
+    ri->purpose = ROUTER_PURPOSE_GENERAL;
+    ri->cache_info.send_unencrypted = 1;
   }
+
+  goto done;
+
+ err:
+  routerinfo_free(ri);
+  *ri_out = NULL;
+  return result;
+
+ done:
+  *ri_out = ri;
+  return 0;
+}
+
+/** Allocate and return a fresh, unsigned extrainfo for this OR, based on the
+ * routerinfo ri.
+ *
+ * Uses options->Nickname to set the nickname, and options->BridgeRelay to set
+ * ei->cache_info.send_unencrypted.
+ *
+ * If ri is NULL, logs a BUG() warning and returns NULL.
+ * Caller is responsible for freeing the generated extrainfo.
+ */
+static extrainfo_t *
+router_build_fresh_unsigned_extrainfo(const routerinfo_t *ri)
+{
+  extrainfo_t *ei = NULL;
+  const or_options_t *options = get_options();
+
+  if (BUG(!ri))
+    return NULL;
 
   /* Now generate the extrainfo. */
   ei = tor_malloc_zero(sizeof(extrainfo_t));
   ei->cache_info.is_extrainfo = 1;
-  strlcpy(ei->nickname, get_options()->Nickname, sizeof(ei->nickname));
+  strlcpy(ei->nickname, options->Nickname, sizeof(ei->nickname));
   ei->cache_info.published_on = ri->cache_info.published_on;
   ei->cache_info.signing_key_cert =
     tor_cert_dup(get_master_signing_key_cert());
 
   memcpy(ei->cache_info.identity_digest, ri->cache_info.identity_digest,
          DIGEST_LEN);
+
+  if (options->BridgeRelay) {
+    /* See note in router_build_fresh_routerinfo(). */
+    ei->cache_info.send_unencrypted = 0;
+  } else {
+    ei->cache_info.send_unencrypted = 1;
+  }
+
+  return ei;
+}
+
+/** Dump the extrainfo descriptor body for ei, sign it, and add the body and
+ * signature to ei->cache_info. Note that the extrainfo body is determined by
+ * ei, and some additional config and statistics state: see
+ * extrainfo_dump_to_string() for details.
+ *
+ * Return 0 on success, -1 on temporary error.
+ * If ei is NULL, logs a BUG() warning and returns -1.
+ * On error, ei->cache_info is not modified.
+ */
+static int
+router_dump_and_sign_extrainfo_descriptor_body(extrainfo_t *ei)
+{
+  if (BUG(!ei))
+    return -1;
+
   if (extrainfo_dump_to_string(&ei->cache_info.signed_descriptor_body,
                                ei, get_server_identity_key(),
                                get_master_signing_keypair()) < 0) {
     log_warn(LD_BUG, "Couldn't generate extra-info descriptor.");
-    extrainfo_free(ei);
-    ei = NULL;
-  } else {
-    ei->cache_info.signed_descriptor_len =
-      strlen(ei->cache_info.signed_descriptor_body);
-    router_get_extrainfo_hash(ei->cache_info.signed_descriptor_body,
-                              ei->cache_info.signed_descriptor_len,
-                              ei->cache_info.signed_descriptor_digest);
-    crypto_digest256((char*) ei->digest256,
-                     ei->cache_info.signed_descriptor_body,
-                     ei->cache_info.signed_descriptor_len,
-                     DIGEST_SHA256);
+    return -1;
+  }
+
+  ei->cache_info.signed_descriptor_len =
+    strlen(ei->cache_info.signed_descriptor_body);
+
+  router_get_extrainfo_hash(ei->cache_info.signed_descriptor_body,
+                            ei->cache_info.signed_descriptor_len,
+                            ei->cache_info.signed_descriptor_digest);
+  crypto_digest256((char*) ei->digest256,
+                   ei->cache_info.signed_descriptor_body,
+                   ei->cache_info.signed_descriptor_len,
+                   DIGEST_SHA256);
+
+  return 0;
+}
+
+/** Allocate and return a fresh, signed extrainfo for this OR, based on the
+ * routerinfo ri.
+ *
+ * If ri is NULL, logs a BUG() warning and returns NULL.
+ * Caller is responsible for freeing the generated extrainfo.
+ */
+STATIC extrainfo_t *
+router_build_fresh_signed_extrainfo(const routerinfo_t *ri)
+{
+  int result = -1;
+  extrainfo_t *ei = NULL;
+
+  if (BUG(!ri))
+    return NULL;
+
+  ei = router_build_fresh_unsigned_extrainfo(ri);
+  /* router_build_fresh_unsigned_extrainfo() should not fail. */
+  if (BUG(!ei))
+    goto err;
+
+  result = router_dump_and_sign_extrainfo_descriptor_body(ei);
+  if (result < 0)
+    goto err;
+
+  goto done;
+
+ err:
+  extrainfo_free(ei);
+  return NULL;
+
+ done:
+  return ei;
+}
+
+/** Set the fields in ri that depend on ei.
+ *
+ * If ei is NULL, logs a BUG() warning and zeroes the relevant fields.
+ */
+STATIC void
+router_update_routerinfo_from_extrainfo(routerinfo_t *ri,
+                                        const extrainfo_t *ei)
+{
+  if (BUG(!ei)) {
+    /* Just to be safe, zero ri->cache_info.extra_info_digest here. */
+    memset(ri->cache_info.extra_info_digest, 0, DIGEST_LEN);
+    memset(ri->cache_info.extra_info_digest256, 0, DIGEST256_LEN);
+    return;
   }
 
   /* Now finish the router descriptor. */
-  if (ei) {
-    memcpy(ri->cache_info.extra_info_digest,
-           ei->cache_info.signed_descriptor_digest,
-           DIGEST_LEN);
-    memcpy(ri->cache_info.extra_info_digest256,
-           ei->digest256,
-           DIGEST256_LEN);
-  } else {
-    /* ri was allocated with tor_malloc_zero, so there is no need to
-     * zero ri->cache_info.extra_info_digest here. */
-  }
+  memcpy(ri->cache_info.extra_info_digest,
+         ei->cache_info.signed_descriptor_digest,
+         DIGEST_LEN);
+  memcpy(ri->cache_info.extra_info_digest256,
+         ei->digest256,
+         DIGEST256_LEN);
+}
+
+/** Dump the descriptor body for ri, sign it, and add the body and signature to
+ * ri->cache_info. Note that the descriptor body is determined by ri, and some
+ * additional config and state: see router_dump_router_to_string() for details.
+ *
+ * Return 0 on success, and a negative value on temporary error.
+ * If ri is NULL, logs a BUG() warning and returns a negative value.
+ * On error, ri->cache_info is not modified.
+ */
+STATIC int
+router_dump_and_sign_routerinfo_descriptor_body(routerinfo_t *ri)
+{
+  if (BUG(!ri))
+    return TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
+
   if (! (ri->cache_info.signed_descriptor_body =
           router_dump_router_to_string(ri, get_server_identity_key(),
                                        get_onion_key(),
                                        get_current_curve25519_keypair(),
                                        get_master_signing_keypair())) ) {
     log_warn(LD_BUG, "Couldn't generate router descriptor.");
-    routerinfo_free(ri);
-    extrainfo_free(ei);
     return TOR_ROUTERINFO_ERROR_CANNOT_GENERATE;
   }
+
   ri->cache_info.signed_descriptor_len =
     strlen(ri->cache_info.signed_descriptor_body);
-
-  ri->purpose =
-    options->BridgeRelay ? ROUTER_PURPOSE_BRIDGE : ROUTER_PURPOSE_GENERAL;
-  if (options->BridgeRelay) {
-    /* Bridges shouldn't be able to send their descriptors unencrypted,
-       anyway, since they don't have a DirPort, and always connect to the
-       bridge authority anonymously.  But just in case they somehow think of
-       sending them on an unencrypted connection, don't allow them to try. */
-    ri->cache_info.send_unencrypted = 0;
-    if (ei)
-      ei->cache_info.send_unencrypted = 0;
-  } else {
-    ri->cache_info.send_unencrypted = 1;
-    if (ei)
-      ei->cache_info.send_unencrypted = 1;
-  }
 
   router_get_router_hash(ri->cache_info.signed_descriptor_body,
                          strlen(ri->cache_info.signed_descriptor_body),
                          ri->cache_info.signed_descriptor_digest);
 
-  if (ei) {
-    tor_assert(!
-          routerinfo_incompatible_with_extrainfo(ri->identity_pkey, ei,
-                                                 &ri->cache_info, NULL));
+  return 0;
+}
+
+/** Build a fresh routerinfo, signed server descriptor, and signed extrainfo
+ * document for this OR.
+ *
+ * Set r to the generated routerinfo, e to the generated extrainfo document.
+ * Failure to generate an extra-info document is not an error and is indicated
+ * by setting e to NULL.
+ * Return 0 on success, and a negative value on temporary error.
+ * Caller is responsible for freeing generated documents on success.
+ */
+int
+router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
+{
+  int result = TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
+  routerinfo_t *ri = NULL;
+  extrainfo_t *ei = NULL;
+
+  if (BUG(!r))
+    goto err;
+
+  if (BUG(!e))
+    goto err;
+
+  result = router_build_fresh_unsigned_routerinfo(&ri);
+  if (result < 0) {
+    goto err;
+  }
+  /* If ri is NULL, then result should be negative. So this check should be
+   * unreachable. */
+  if (BUG(!ri)) {
+    result = TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
+    goto err;
   }
 
+  ei = router_build_fresh_signed_extrainfo(ri);
+
+  /* Failing to create an ei is not an error. */
+  if (ei) {
+    router_update_routerinfo_from_extrainfo(ri, ei);
+  }
+
+  result = router_dump_and_sign_routerinfo_descriptor_body(ri);
+  if (result < 0)
+    goto err;
+
+  if (ei) {
+     if (BUG(routerinfo_incompatible_with_extrainfo(ri->identity_pkey, ei,
+                                                    &ri->cache_info, NULL))) {
+       result = TOR_ROUTERINFO_ERROR_INTERNAL_BUG;
+       goto err;
+     }
+  }
+
+  goto done;
+
+ err:
+  routerinfo_free(ri);
+  extrainfo_free(ei);
+  *r = NULL;
+  *e = NULL;
+  return result;
+
+ done:
   *r = ri;
   *e = ei;
   return 0;
@@ -2074,34 +2444,24 @@ router_build_fresh_descriptor(routerinfo_t **r, extrainfo_t **e)
 
 /** If <b>force</b> is true, or our descriptor is out-of-date, rebuild a fresh
  * routerinfo, signed server descriptor, and extra-info document for this OR.
- * Return 0 on success, -1 on temporary error.
+ *
+ * Return true on success, else false on temporary error.
  */
-int
+bool
 router_rebuild_descriptor(int force)
 {
   int err = 0;
   routerinfo_t *ri;
   extrainfo_t *ei;
-  uint32_t addr;
-  const or_options_t *options = get_options();
 
   if (desc_clean_since && !force)
-    return 0;
-
-  if (router_pick_published_address(options, &addr, 0) < 0 ||
-      router_get_advertised_or_port(options) == 0) {
-    /* Stop trying to rebuild our descriptor every second. We'll
-     * learn that it's time to try again when ip_address_changed()
-     * marks it dirty. */
-    desc_clean_since = time(NULL);
-    return TOR_ROUTERINFO_ERROR_DESC_REBUILDING;
-  }
+    return true;
 
   log_info(LD_OR, "Rebuilding relay descriptor%s", force ? " (forced)" : "");
 
   err = router_build_fresh_descriptor(&ri, &ei);
   if (err < 0) {
-    return err;
+    return false;
   }
 
   routerinfo_free(desc_routerinfo);
@@ -2117,7 +2477,41 @@ router_rebuild_descriptor(int force)
   }
   desc_dirty_reason = NULL;
   control_event_my_descriptor_changed();
-  return 0;
+  return true;
+}
+
+/** Called when we have a new set of consensus parameters. */
+void
+router_new_consensus_params(const networkstatus_t *ns)
+{
+  const int32_t DEFAULT_ASSUME_REACHABLE = 0;
+  const int32_t DEFAULT_ASSUME_REACHABLE_IPV6 = 0;
+  int ar, ar6;
+  ar = networkstatus_get_param(ns,
+                               "assume-reachable",
+                               DEFAULT_ASSUME_REACHABLE, 0, 1);
+  ar6 = networkstatus_get_param(ns,
+                                "assume-reachable-ipv6",
+                                DEFAULT_ASSUME_REACHABLE_IPV6, 0, 1);
+
+  publish_even_when_ipv4_orport_unreachable = ar;
+  publish_even_when_ipv6_orport_unreachable = ar || ar6;
+}
+
+/** Mark our descriptor out of data iff the IPv6 omit status flag is flipped
+ * it changes from its previous value.
+ *
+ * This is used when our IPv6 port is found reachable or not. */
+void
+mark_my_descriptor_if_omit_ipv6_changes(const char *reason, bool omit_ipv6)
+{
+  bool previous = omit_ipv6_on_publish;
+  omit_ipv6_on_publish = omit_ipv6;
+
+  /* Only mark it dirty if the IPv6 omit flag was flipped. */
+  if (previous != omit_ipv6) {
+    mark_my_descriptor_dirty(reason);
+  }
 }
 
 /** If our router descriptor ever goes this long without being regenerated
@@ -2152,7 +2546,9 @@ mark_my_descriptor_dirty_if_too_old(time_t now)
   /* Now we see whether we want to be retrying frequently or no.  The
    * rule here is that we'll retry frequently if we aren't listed in the
    * live consensus we have, or if the publication time of the
-   * descriptor listed for us in the consensus is very old. */
+   * descriptor listed for us in the consensus is very old, or if the
+   * consensus lists us as "stale" and we haven't regenerated since the
+   * consensus was published. */
   ns = networkstatus_get_live_consensus(now);
   if (ns) {
     rs = networkstatus_vote_find_entry(ns, server_identitykey_digest);
@@ -2160,6 +2556,8 @@ mark_my_descriptor_dirty_if_too_old(time_t now)
       retry_fast_reason = "not listed in consensus";
     else if (rs->published_on < slow_cutoff)
       retry_fast_reason = "version listed in consensus is quite old";
+    else if (rs->is_staledesc && ns->valid_after > desc_clean_since)
+      retry_fast_reason = "listed as stale in consensus";
   }
 
   if (retry_fast_reason && desc_clean_since < fast_cutoff)
@@ -2174,11 +2572,13 @@ mark_my_descriptor_dirty(const char *reason)
   if (BUG(reason == NULL)) {
     reason = "marked descriptor dirty for unspecified reason";
   }
-  if (server_mode(options) && options->PublishServerDescriptor_)
+  if (server_mode(options) && options->PublishServerDescriptor_) {
     log_info(LD_OR, "Decided to publish new relay descriptor: %s", reason);
+  }
   desc_clean_since = 0;
   if (!desc_dirty_reason)
     desc_dirty_reason = reason;
+  reschedule_descriptor_update_check();
 }
 
 /** How frequently will we republish our descriptor because of large (factor
@@ -2217,7 +2617,7 @@ check_descriptor_bandwidth_changed(time_t now)
 
   /* Consider ourselves to have zero bandwidth if we're hibernating or
    * shutting down. */
-  cur = hibernating ? 0 : rep_hist_bandwidth_assess();
+  cur = hibernating ? 0 : bwhist_bandwidth_assess();
 
   if ((prev != cur && (!prev || !cur)) ||
       cur > (prev * BANDWIDTH_CHANGE_FACTOR) ||
@@ -2231,9 +2631,13 @@ check_descriptor_bandwidth_changed(time_t now)
   }
 }
 
+// This function can be "noreturn" if relay mode is disabled and
+// ALL_BUGS_ARE_FATAL is set.
+DISABLE_GCC_WARNING("-Wmissing-noreturn")
+
 /** Note at log level severity that our best guess of address has changed from
  * <b>prev</b> to <b>cur</b>. */
-static void
+void
 log_addr_has_changed(int severity,
                      const tor_addr_t *prev,
                      const tor_addr_t *cur,
@@ -2260,129 +2664,71 @@ log_addr_has_changed(int severity,
              "Guessed our IP address as %s (source: %s).",
              addrbuf_cur, source);
 }
+ENABLE_GCC_WARNING("-Wmissing-noreturn")
 
-/** Check whether our own address as defined by the Address configuration
- * has changed. This is for routers that get their address from a service
- * like dyndns. If our address has changed, mark our descriptor dirty. */
+/** Check whether our own address has changed versus the one we have in our
+ * current descriptor.
+ *
+ * If our address has changed, call ip_address_changed() which takes
+ * appropriate actions. */
 void
 check_descriptor_ipaddress_changed(time_t now)
 {
-  uint32_t prev, cur;
-  const or_options_t *options = get_options();
-  const char *method = NULL;
-  char *hostname = NULL;
   const routerinfo_t *my_ri = router_get_my_routerinfo();
+  resolved_addr_method_t method = RESOLVED_ADDR_NONE;
+  char *hostname = NULL;
+  int families[2] = { AF_INET, AF_INET6 };
+  bool has_changed = false;
 
   (void) now;
 
-  if (my_ri == NULL) /* make sure routerinfo exists */
-    return;
-
-  /* XXXX ipv6 */
-  prev = my_ri->addr;
-  if (resolve_my_address(LOG_INFO, options, &cur, &method, &hostname) < 0) {
-    log_info(LD_CONFIG,"options->Address didn't resolve into an IP.");
+  /* We can't learn our descriptor address without one. */
+  if (my_ri == NULL) {
     return;
   }
 
-  if (prev != cur) {
-    char *source;
-    tor_addr_t tmp_prev, tmp_cur;
+  for (size_t i = 0; i < ARRAY_LENGTH(families); i++) {
+    tor_addr_t current;
+    const tor_addr_t *previous;
+    int family = families[i];
 
-    tor_addr_from_ipv4h(&tmp_prev, prev);
-    tor_addr_from_ipv4h(&tmp_cur, cur);
+    /* Get the descriptor address from the family we are looking up. */
+    previous = &my_ri->ipv4_addr;
+    if (family == AF_INET6) {
+      previous = &my_ri->ipv6_addr;
+    }
 
-    tor_asprintf(&source, "METHOD=%s%s%s", method,
-                 hostname ? " HOSTNAME=" : "",
-                 hostname ? hostname : "");
+    /* Attempt to discovery the publishable address for the family which will
+     * actively attempt to discover the address if we are configured with a
+     * port for the family.
+     *
+     * It is OK to ignore the returned value here since in the failure case,
+     * that is the address was not found, the current value is set to UNSPEC.
+     * Add this (void) so Coverity is happy. */
+    (void) relay_find_addr_to_publish(get_options(), family,
+                                      RELAY_FIND_ADDR_NO_FLAG, &current);
 
-    log_addr_has_changed(LOG_NOTICE, &tmp_prev, &tmp_cur, source);
-    tor_free(source);
+    /* The "current" address might be UNSPEC meaning it was not discovered nor
+     * found in our current cache. If we had an address before and we have
+     * none now, we consider this an IP change since it appears the relay lost
+     * its address. */
 
+    if (!tor_addr_eq(previous, &current)) {
+      char *source;
+      tor_asprintf(&source, "METHOD=%s%s%s",
+                   resolved_addr_method_to_str(method),
+                   hostname ? " HOSTNAME=" : "",
+                   hostname ? hostname : "");
+      log_addr_has_changed(LOG_NOTICE, previous, &current, source);
+      tor_free(source);
+      has_changed = true;
+    }
+    tor_free(hostname);
+  }
+
+  if (has_changed) {
     ip_address_changed(0);
   }
-
-  tor_free(hostname);
-}
-
-/** The most recently guessed value of our IP address, based on directory
- * headers. */
-static tor_addr_t last_guessed_ip = TOR_ADDR_NULL;
-
-/** A directory server <b>d_conn</b> told us our IP address is
- * <b>suggestion</b>.
- * If this address is different from the one we think we are now, and
- * if our computer doesn't actually know its IP address, then switch. */
-void
-router_new_address_suggestion(const char *suggestion,
-                              const dir_connection_t *d_conn)
-{
-  tor_addr_t addr;
-  uint32_t cur = 0;             /* Current IPv4 address.  */
-  const or_options_t *options = get_options();
-
-  /* first, learn what the IP address actually is */
-  if (tor_addr_parse(&addr, suggestion) == -1) {
-    log_debug(LD_DIR, "Malformed X-Your-Address-Is header %s. Ignoring.",
-              escaped(suggestion));
-    return;
-  }
-
-  log_debug(LD_DIR, "Got X-Your-Address-Is: %s.", suggestion);
-
-  if (!server_mode(options)) {
-    tor_addr_copy(&last_guessed_ip, &addr);
-    return;
-  }
-
-  /* XXXX ipv6 */
-  cur = get_last_resolved_addr();
-  if (cur ||
-      resolve_my_address(LOG_INFO, options, &cur, NULL, NULL) >= 0) {
-    /* We're all set -- we already know our address. Great. */
-    tor_addr_from_ipv4h(&last_guessed_ip, cur); /* store it in case we
-                                                   need it later */
-    return;
-  }
-  if (tor_addr_is_internal(&addr, 0)) {
-    /* Don't believe anybody who says our IP is, say, 127.0.0.1. */
-    return;
-  }
-  if (tor_addr_eq(&d_conn->base_.addr, &addr)) {
-    /* Don't believe anybody who says our IP is their IP. */
-    log_debug(LD_DIR, "A directory server told us our IP address is %s, "
-              "but they are just reporting their own IP address. Ignoring.",
-              suggestion);
-    return;
-  }
-
-  /* Okay.  We can't resolve our own address, and X-Your-Address-Is is giving
-   * us an answer different from what we had the last time we managed to
-   * resolve it. */
-  if (!tor_addr_eq(&last_guessed_ip, &addr)) {
-    control_event_server_status(LOG_NOTICE,
-                                "EXTERNAL_ADDRESS ADDRESS=%s METHOD=DIRSERV",
-                                suggestion);
-    log_addr_has_changed(LOG_NOTICE, &last_guessed_ip, &addr,
-                         d_conn->base_.address);
-    ip_address_changed(0);
-    tor_addr_copy(&last_guessed_ip, &addr); /* router_rebuild_descriptor()
-                                               will fetch it */
-  }
-}
-
-/** We failed to resolve our address locally, but we'd like to build
- * a descriptor and publish / test reachability. If we have a guess
- * about our address based on directory headers, answer it and return
- * 0; else return -1. */
-static int
-router_guess_address_from_dir_headers(uint32_t *guess)
-{
-  if (!tor_addr_is_null(&last_guessed_ip)) {
-    *guess = tor_addr_to_ipv4h(&last_guessed_ip);
-    return 0;
-  }
-  return -1;
 }
 
 /** Set <b>platform</b> (max length <b>len</b>) to a NUL-terminated short
@@ -2405,6 +2751,10 @@ get_platform_str(char *platform, size_t len)
 /** OR only: Given a routerinfo for this router, and an identity key to sign
  * with, encode the routerinfo as a signed server descriptor and return a new
  * string encoding the result, or NULL on failure.
+ *
+ * In addition to the fields in router, this function calls
+ * onion_key_lifetime(), get_options(), and we_are_hibernating(), and uses the
+ * results to populate some fields in the descriptor.
  */
 char *
 router_dump_router_to_string(routerinfo_t *router,
@@ -2468,11 +2818,8 @@ router_dump_router_to_string(routerinfo_t *router,
       log_err(LD_BUG,"Couldn't base64-encode signing key certificate!");
       goto err;
     }
-    if (ed25519_public_to_base64(ed_fp_base64,
-                       &router->cache_info.signing_key_cert->signing_key)<0) {
-      log_err(LD_BUG,"Couldn't base64-encode identity key\n");
-      goto err;
-    }
+    ed25519_public_to_base64(ed_fp_base64,
+                            &router->cache_info.signing_key_cert->signing_key);
     tor_asprintf(&ed_cert_line, "identity-ed25519\n"
                  "-----BEGIN ED25519 CERT-----\n"
                  "%s"
@@ -2587,7 +2934,7 @@ router_dump_router_to_string(routerinfo_t *router,
     }
   }
 
-  if (router->ipv6_orport &&
+  if (!omit_ipv6_on_publish && router->ipv6_orport &&
       tor_addr_family(&router->ipv6_addr) == AF_INET6) {
     char addr[TOR_ADDR_BUF_LEN];
     const char *a;
@@ -2605,7 +2952,10 @@ router_dump_router_to_string(routerinfo_t *router,
     proto_line = tor_strdup("");
   }
 
-  address = tor_dup_ip(router->addr);
+  address = tor_addr_to_str_dup(&router->ipv4_addr);
+  if (!address)
+    goto err;
+
   chunks = smartlist_new();
 
   /* Generate the easy portion of the router descriptor. */
@@ -2626,8 +2976,8 @@ router_dump_router_to_string(routerinfo_t *router,
                     "%s%s%s",
     router->nickname,
     address,
-    router->or_port,
-    router_should_advertise_dirport(options, router->dir_port),
+    router->ipv4_orport,
+    router_should_advertise_dirport(options, router->ipv4_dirport),
     ed_cert_line ? ed_cert_line : "",
     extra_or_address ? extra_or_address : "",
     router->platform,
@@ -2673,11 +3023,9 @@ router_dump_router_to_string(routerinfo_t *router,
   }
 
   if (router->onion_curve25519_pkey) {
-    char kbuf[128];
-    base64_encode(kbuf, sizeof(kbuf),
-                  (const char *)router->onion_curve25519_pkey->public_key,
-                  CURVE25519_PUBKEY_LEN, BASE64_ENCODE_MULTILINE);
-    smartlist_add_asprintf(chunks, "ntor-onion-key %s", kbuf);
+    char kbuf[CURVE25519_BASE64_PADDED_LEN + 1];
+    curve25519_public_to_base64(kbuf, router->onion_curve25519_pkey, false);
+    smartlist_add_asprintf(chunks, "ntor-onion-key %s\n", kbuf);
   } else {
     /* Authorities will start rejecting relays without ntor keys in 0.2.9 */
     log_err(LD_BUG, "A relay must have an ntor onion key");
@@ -2711,6 +3059,15 @@ router_dump_router_to_string(routerinfo_t *router,
     smartlist_add_strdup(chunks, "tunnelled-dir-server\n");
   }
 
+  /* Overload general information. */
+  if (options->OverloadStatistics) {
+    char *overload_general = rep_hist_get_overload_general_line();
+
+    if (overload_general) {
+      smartlist_add(chunks, overload_general);
+    }
+  }
+
   /* Sign the descriptor with Ed25519 */
   if (emit_ed_sigs)  {
     smartlist_add_strdup(chunks, "router-sig-ed25519 ");
@@ -2722,8 +3079,7 @@ router_dump_router_to_string(routerinfo_t *router,
     if (ed25519_sign(&sig, (const uint8_t*)digest, DIGEST256_LEN,
                      signing_keypair) < 0)
       goto err;
-    if (ed25519_signature_to_base64(buf, &sig) < 0)
-      goto err;
+    ed25519_signature_to_base64(buf, &sig);
 
     smartlist_add_asprintf(chunks, "%s\n", buf);
   }
@@ -2808,88 +3164,100 @@ router_dump_exit_policy_to_string(const routerinfo_t *router,
                                include_ipv6);
 }
 
-/** Load the contents of <b>filename</b>, find the last line starting with
- * <b>end_line</b>, ensure that its timestamp is not more than 25 hours in
- * the past or more than 1 hour in the future with respect to <b>now</b>,
- * and write the file contents starting with that line to *<b>out</b>.
- * Return 1 for success, 0 if the file does not exist or is empty, or -1
- * if the file does not contain a line matching these criteria or other
- * failure. */
-static int
-load_stats_file(const char *filename, const char *end_line, time_t now,
+/** Load the contents of <b>filename</b>, find a line starting with
+ * timestamp tag <b>ts_tag</b>, ensure that its timestamp is not more than 25
+ * hours in the past or more than 1 hour in the future with respect to
+ * <b>now</b>, and write the entire file contents into <b>out</b>.
+ *
+ * The timestamp expected should be an ISO-formatted UTC time value which is
+ * parsed using our parse_iso_time() function.
+ *
+ * In case more than one tag are found in the file, the very first one is
+ * used.
+ *
+ * Return 1 for success, 0 if the file does not exist or is empty, or -1 if
+ * the file does not contain a line with the timestamp tag. */
+STATIC int
+load_stats_file(const char *filename, const char *ts_tag, time_t now,
                 char **out)
 {
   int r = -1;
   char *fname = get_datadir_fname(filename);
-  char *contents, *start = NULL, *tmp, timestr[ISO_TIME_LEN+1];
+  char *contents = NULL, timestr[ISO_TIME_LEN+1];
   time_t written;
+
   switch (file_status(fname)) {
-    case FN_FILE:
-      /* X022 Find an alternative to reading the whole file to memory. */
-      if ((contents = read_file_to_str(fname, 0, NULL))) {
-        tmp = strstr(contents, end_line);
-        /* Find last block starting with end_line */
-        while (tmp) {
-          start = tmp;
-          tmp = strstr(tmp + 1, end_line);
-        }
-        if (!start)
-          goto notfound;
-        if (strlen(start) < strlen(end_line) + 1 + sizeof(timestr))
-          goto notfound;
-        strlcpy(timestr, start + 1 + strlen(end_line), sizeof(timestr));
-        if (parse_iso_time(timestr, &written) < 0)
-          goto notfound;
-        if (written < now - (25*60*60) || written > now + (1*60*60))
-          goto notfound;
-        *out = tor_strdup(start);
-        r = 1;
-      }
-     notfound:
-      tor_free(contents);
-      break;
-    /* treat empty stats files as if the file doesn't exist */
-    case FN_NOENT:
-    case FN_EMPTY:
-      r = 0;
-      break;
-    case FN_ERROR:
-    case FN_DIR:
-    default:
-      break;
+  case FN_FILE:
+    contents = read_file_to_str(fname, 0, NULL);
+    if (contents == NULL) {
+      log_debug(LD_BUG, "Unable to read content of %s", filename);
+      goto end;
+    }
+    /* Find the timestamp tag to validate that the file is not too old or if
+     * exists. */
+    const char *ts_tok = find_str_at_start_of_line(contents, ts_tag);
+    if (!ts_tok) {
+      log_warn(LD_BUG, "Token %s not found in file %s", ts_tag, filename);
+      goto end;
+    }
+    /* Do we have enough for parsing a timestamp? */
+    if (strlen(ts_tok) < strlen(ts_tag) + 1 + sizeof(timestr)) {
+      log_warn(LD_BUG, "Token %s malformed in file %s", ts_tag, filename);
+      goto end;
+    }
+    /* Parse timestamp in order to validate it is not too old. */
+    strlcpy(timestr, ts_tok + strlen(ts_tag) + 1, sizeof(timestr));
+    if (parse_iso_time(timestr, &written) < 0) {
+      log_warn(LD_BUG, "Token %s has a malformed timestamp in file %s",
+               ts_tag, filename);
+      goto end;
+    }
+    if (written < now - (25*60*60) || written > now + (1*60*60)) {
+      /* This can happen normally so don't log. */
+      goto end;
+    }
+    /* Success. Put in the entire content. */
+    *out = contents;
+    contents = NULL; /* Must not free it. */
+    r = 1;
+    break;
+  /* treat empty stats files as if the file doesn't exist */
+  case FN_NOENT:
+  case FN_EMPTY:
+    r = 0;
+    break;
+  case FN_ERROR:
+  case FN_DIR:
+  default:
+    break;
   }
+
+ end:
   tor_free(fname);
+  tor_free(contents);
   return r;
 }
 
-/** Write the contents of <b>extrainfo</b> and aggregated statistics to
- * *<b>s_out</b>, signing them with <b>ident_key</b>. Return 0 on
- * success, negative on failure. */
-int
-extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
-                         crypto_pk_t *ident_key,
-                         const ed25519_keypair_t *signing_keypair)
+/** Add header strings to chunks, based on the extrainfo object extrainfo,
+ * and ed25519 keypair signing_keypair, if emit_ed_sigs is true.
+ * Helper for extrainfo_dump_to_string().
+ * Returns 0 on success, negative on failure. */
+static int
+extrainfo_dump_to_string_header_helper(
+                                     smartlist_t *chunks,
+                                     const extrainfo_t *extrainfo,
+                                     const ed25519_keypair_t *signing_keypair,
+                                     int emit_ed_sigs)
 {
-  const or_options_t *options = get_options();
   char identity[HEX_DIGEST_LEN+1];
   char published[ISO_TIME_LEN+1];
-  char digest[DIGEST_LEN];
-  char *bandwidth_usage;
-  int result;
-  static int write_stats_to_extrainfo = 1;
-  char sig[DIROBJ_MAX_SIG_LEN+1];
-  char *s = NULL, *pre, *contents, *cp, *s_dup = NULL;
-  time_t now = time(NULL);
-  smartlist_t *chunks = smartlist_new();
-  extrainfo_t *ei_tmp = NULL;
-  const int emit_ed_sigs = signing_keypair &&
-    extrainfo->cache_info.signing_key_cert;
   char *ed_cert_line = NULL;
+  char *pre = NULL;
+  int rv = -1;
 
   base16_encode(identity, sizeof(identity),
                 extrainfo->cache_info.identity_digest, DIGEST_LEN);
   format_iso_time(published, extrainfo->cache_info.published_on);
-  bandwidth_usage = rep_hist_get_bandwidth_lines();
   if (emit_ed_sigs) {
     if (!extrainfo->cache_info.signing_key_cert->signing_key_included ||
         !ed25519_pubkey_eq(&extrainfo->cache_info.signing_key_cert->signed_key,
@@ -2915,21 +3283,64 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
     ed_cert_line = tor_strdup("");
   }
 
-  tor_asprintf(&pre, "extra-info %s %s\n%spublished %s\n%s",
+  /* This is the first chunk in the file. If the file is too big, other chunks
+   * are removed. So we must only add one chunk here. */
+  tor_asprintf(&pre, "extra-info %s %s\n%spublished %s\n",
                extrainfo->nickname, identity,
                ed_cert_line,
-               published, bandwidth_usage);
+               published);
   smartlist_add(chunks, pre);
 
-  if (geoip_is_loaded(AF_INET))
-    smartlist_add_asprintf(chunks, "geoip-db-digest %s\n",
-                           geoip_db_digest(AF_INET));
-  if (geoip_is_loaded(AF_INET6))
-    smartlist_add_asprintf(chunks, "geoip6-db-digest %s\n",
-                           geoip_db_digest(AF_INET6));
+  rv = 0;
+  goto done;
+
+ err:
+  rv = -1;
+
+ done:
+  tor_free(ed_cert_line);
+  return rv;
+}
+
+/** Add pluggable transport and statistics strings to chunks, skipping
+ * statistics if write_stats_to_extrainfo is false.
+ * Helper for extrainfo_dump_to_string().
+ * Can not fail. */
+static void
+extrainfo_dump_to_string_stats_helper(smartlist_t *chunks,
+                                      int write_stats_to_extrainfo)
+{
+  const or_options_t *options = get_options();
+  char *contents = NULL;
+  time_t now = time(NULL);
+
+  /* If the file is too big, these chunks are removed, starting with the last
+   * chunk. So each chunk must be a complete line, and the file must be valid
+   * after each chunk. */
+
+  /* Add information about the pluggable transports we support, even if we
+   * are not publishing statistics. This information is needed by BridgeDB
+   * to distribute bridges. */
+  if (options->ServerTransportPlugin) {
+    char *pluggable_transports = pt_get_extra_info_descriptor_string();
+    if (pluggable_transports)
+      smartlist_add(chunks, pluggable_transports);
+  }
 
   if (options->ExtraInfoStatistics && write_stats_to_extrainfo) {
     log_info(LD_GENERAL, "Adding stats to extra-info descriptor.");
+    /* Bandwidth usage stats don't have their own option */
+    {
+      contents = bwhist_get_bandwidth_lines();
+      smartlist_add(chunks, contents);
+    }
+    /* geoip hashes aren't useful unless we are publishing other stats */
+    if (geoip_is_loaded(AF_INET))
+      smartlist_add_asprintf(chunks, "geoip-db-digest %s\n",
+                             geoip_db_digest(AF_INET));
+    if (geoip_is_loaded(AF_INET6))
+      smartlist_add_asprintf(chunks, "geoip6-db-digest %s\n",
+                             geoip_db_digest(AF_INET6));
     if (options->DirReqStatistics &&
         load_stats_file("stats"PATH_SEPARATOR"dirreq-stats",
                         "dirreq-stats-end", now, &contents) > 0) {
@@ -2938,6 +3349,11 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
     if (options->HiddenServiceStatistics &&
         load_stats_file("stats"PATH_SEPARATOR"hidserv-stats",
                         "hidserv-stats-end", now, &contents) > 0) {
+      smartlist_add(chunks, contents);
+    }
+    if (options->HiddenServiceStatistics &&
+        load_stats_file("stats"PATH_SEPARATOR"hidserv-v3-stats",
+                        "hidserv-v3-stats-end", now, &contents) > 0) {
       smartlist_add(chunks, contents);
     }
     if (options->EntryStatistics &&
@@ -2965,50 +3381,146 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
       if (contents)
         smartlist_add(chunks, contents);
     }
-  }
-
-  /* Add information about the pluggable transports we support. */
-  if (options->ServerTransportPlugin) {
-    char *pluggable_transports = pt_get_extra_info_descriptor_string();
-    if (pluggable_transports)
-      smartlist_add(chunks, pluggable_transports);
-  }
-
-  if (should_record_bridge_info(options) && write_stats_to_extrainfo) {
-    const char *bridge_stats = geoip_get_bridge_stats_extrainfo(now);
-    if (bridge_stats) {
-      smartlist_add_strdup(chunks, bridge_stats);
+    if (options->OverloadStatistics) {
+      contents = rep_hist_get_overload_stats_lines();
+      if (contents) {
+        smartlist_add(chunks, contents);
+      }
+    }
+    /* bridge statistics */
+    if (should_record_bridge_info(options)) {
+      const char *bridge_stats = geoip_get_bridge_stats_extrainfo(now);
+      if (bridge_stats) {
+        smartlist_add_strdup(chunks, bridge_stats);
+      }
     }
   }
+}
+
+/** Add an ed25519 signature of chunks to chunks, using the ed25519 keypair
+ * signing_keypair.
+ * Helper for extrainfo_dump_to_string().
+ * Returns 0 on success, negative on failure. */
+static int
+extrainfo_dump_to_string_ed_sig_helper(
+                                     smartlist_t *chunks,
+                                     const ed25519_keypair_t *signing_keypair)
+{
+  char sha256_digest[DIGEST256_LEN];
+  ed25519_signature_t ed_sig;
+  char buf[ED25519_SIG_BASE64_LEN+1];
+  int rv = -1;
+
+  /* These are two of the three final chunks in the file. If the file is too
+   * big, other chunks are removed. So we must only add two chunks here. */
+  smartlist_add_strdup(chunks, "router-sig-ed25519 ");
+  crypto_digest_smartlist_prefix(sha256_digest, DIGEST256_LEN,
+                                 ED_DESC_SIGNATURE_PREFIX,
+                                 chunks, "", DIGEST_SHA256);
+  if (ed25519_sign(&ed_sig, (const uint8_t*)sha256_digest, DIGEST256_LEN,
+                   signing_keypair) < 0)
+    goto err;
+  ed25519_signature_to_base64(buf, &ed_sig);
+
+  smartlist_add_asprintf(chunks, "%s\n", buf);
+
+  rv = 0;
+  goto done;
+
+ err:
+  rv = -1;
+
+ done:
+  return rv;
+}
+
+/** Add an RSA signature of extrainfo_string to chunks, using the RSA key
+ * ident_key.
+ * Helper for extrainfo_dump_to_string().
+ * Returns 0 on success, negative on failure. */
+static int
+extrainfo_dump_to_string_rsa_sig_helper(smartlist_t *chunks,
+                                        crypto_pk_t *ident_key,
+                                        const char *extrainfo_string)
+{
+  char sig[DIROBJ_MAX_SIG_LEN+1];
+  char digest[DIGEST_LEN];
+  int rv = -1;
+
+  memset(sig, 0, sizeof(sig));
+  if (router_get_extrainfo_hash(extrainfo_string, strlen(extrainfo_string),
+                                digest) < 0 ||
+      router_append_dirobj_signature(sig, sizeof(sig), digest, DIGEST_LEN,
+                                     ident_key) < 0) {
+    log_warn(LD_BUG, "Could not append signature to extra-info "
+                     "descriptor.");
+    goto err;
+  }
+  smartlist_add_strdup(chunks, sig);
+
+  rv = 0;
+  goto done;
+
+ err:
+  rv = -1;
+
+ done:
+  return rv;
+}
+
+/** Write the contents of <b>extrainfo</b>, to * *<b>s_out</b>, signing them
+ * with <b>ident_key</b>.
+ *
+ * If ExtraInfoStatistics is 1, also write aggregated statistics and related
+ * configuration data before signing. Most statistics also have an option that
+ * enables or disables that particular statistic.
+ *
+ * Always write pluggable transport lines.
+ *
+ * Return 0 on success, negative on failure. */
+int
+extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
+                         crypto_pk_t *ident_key,
+                         const ed25519_keypair_t *signing_keypair)
+{
+  int result;
+  static int write_stats_to_extrainfo = 1;
+  char *s = NULL, *cp, *s_dup = NULL;
+  smartlist_t *chunks = smartlist_new();
+  extrainfo_t *ei_tmp = NULL;
+  const int emit_ed_sigs = signing_keypair &&
+    extrainfo->cache_info.signing_key_cert;
+  int rv = 0;
+
+  rv = extrainfo_dump_to_string_header_helper(chunks, extrainfo,
+                                              signing_keypair,
+                                              emit_ed_sigs);
+  if (rv < 0)
+    goto err;
+
+  extrainfo_dump_to_string_stats_helper(chunks, write_stats_to_extrainfo);
 
   if (emit_ed_sigs) {
-    char sha256_digest[DIGEST256_LEN];
-    smartlist_add_strdup(chunks, "router-sig-ed25519 ");
-    crypto_digest_smartlist_prefix(sha256_digest, DIGEST256_LEN,
-                                   ED_DESC_SIGNATURE_PREFIX,
-                                   chunks, "", DIGEST_SHA256);
-    ed25519_signature_t ed_sig;
-    char buf[ED25519_SIG_BASE64_LEN+1];
-    if (ed25519_sign(&ed_sig, (const uint8_t*)sha256_digest, DIGEST256_LEN,
-                     signing_keypair) < 0)
+    rv = extrainfo_dump_to_string_ed_sig_helper(chunks, signing_keypair);
+    if (rv < 0)
       goto err;
-    if (ed25519_signature_to_base64(buf, &ed_sig) < 0)
-      goto err;
-
-    smartlist_add_asprintf(chunks, "%s\n", buf);
   }
 
+  /* This is one of the three final chunks in the file. If the file is too big,
+   * other chunks are removed. So we must only add one chunk here. */
   smartlist_add_strdup(chunks, "router-signature\n");
   s = smartlist_join_strings(chunks, "", 0, NULL);
 
   while (strlen(s) > MAX_EXTRAINFO_UPLOAD_SIZE - DIROBJ_MAX_SIG_LEN) {
     /* So long as there are at least two chunks (one for the initial
      * extra-info line and one for the router-signature), we can keep removing
-     * things. */
-    if (smartlist_len(chunks) > 2) {
-      /* We remove the next-to-last element (remember, len-1 is the last
-         element), since we need to keep the router-signature element. */
-      int idx = smartlist_len(chunks) - 2;
+     * things. If emit_ed_sigs is true, we also keep 2 additional chunks at the
+     * end for the ed25519 signature. */
+    const int required_chunks = emit_ed_sigs ? 4 : 2;
+    if (smartlist_len(chunks) > required_chunks) {
+      /* We remove the next-to-last or 4th-last element (remember, len-1 is the
+       * last element), since we need to keep the router-signature elements. */
+      int idx = smartlist_len(chunks) - required_chunks;
       char *e = smartlist_get(chunks, idx);
       smartlist_del_keeporder(chunks, idx);
       log_warn(LD_GENERAL, "We just generated an extra-info descriptor "
@@ -3025,15 +3537,10 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
     }
   }
 
-  memset(sig, 0, sizeof(sig));
-  if (router_get_extrainfo_hash(s, strlen(s), digest) < 0 ||
-      router_append_dirobj_signature(sig, sizeof(sig), digest, DIGEST_LEN,
-                                     ident_key) < 0) {
-    log_warn(LD_BUG, "Could not append signature to extra-info "
-                     "descriptor.");
+  rv = extrainfo_dump_to_string_rsa_sig_helper(chunks, ident_key, s);
+  if (rv < 0)
     goto err;
-  }
-  smartlist_add_strdup(chunks, sig);
+
   tor_free(s);
   s = smartlist_join_strings(chunks, "", 0, NULL);
 
@@ -3069,9 +3576,7 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
   SMARTLIST_FOREACH(chunks, char *, chunk, tor_free(chunk));
   smartlist_free(chunks);
   tor_free(s_dup);
-  tor_free(ed_cert_line);
   extrainfo_free(ei_tmp);
-  tor_free(bandwidth_usage);
 
   return result;
 }
@@ -3081,9 +3586,9 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
 void
 router_reset_warnings(void)
 {
-  if (warned_nonexistent_family) {
-    SMARTLIST_FOREACH(warned_nonexistent_family, char *, cp, tor_free(cp));
-    smartlist_clear(warned_nonexistent_family);
+  if (warned_family) {
+    SMARTLIST_FOREACH(warned_family, char *, cp, tor_free(cp));
+    smartlist_clear(warned_family);
   }
 }
 
@@ -3096,6 +3601,10 @@ router_free_all(void)
   crypto_pk_free(server_identitykey);
   crypto_pk_free(client_identitykey);
 
+  /* Destroying a locked mutex is undefined behaviour. This mutex may be
+   * locked, because multiple threads can access it. But we need to destroy
+   * it, otherwise re-initialisation will trigger undefined behaviour.
+   * See #31735 for details. */
   tor_mutex_free(key_lock);
   routerinfo_free(desc_routerinfo);
   extrainfo_free(desc_extrainfo);
@@ -3107,11 +3616,12 @@ router_free_all(void)
   memwipe(&curve25519_onion_key, 0, sizeof(curve25519_onion_key));
   memwipe(&last_curve25519_onion_key, 0, sizeof(last_curve25519_onion_key));
 
-  if (warned_nonexistent_family) {
-    SMARTLIST_FOREACH(warned_nonexistent_family, char *, cp, tor_free(cp));
-    smartlist_free(warned_nonexistent_family);
+  if (warned_family) {
+    SMARTLIST_FOREACH(warned_family, char *, cp, tor_free(cp));
+    smartlist_free(warned_family);
   }
 }
+
 /* From the given RSA key object, convert it to ASN-1 encoded format and set
  * the newly allocated object in onion_pkey_out. The length of the key is set
  * in onion_pkey_len_out. */
@@ -3139,7 +3649,7 @@ router_set_rsa_onion_pkey(const crypto_pk_t *pk, char **onion_pkey_out,
 }
 
 /* From an ASN-1 encoded onion pkey, return a newly allocated RSA key object.
- * It is the caller responsability to free the returned object.
+ * It is the caller's responsibility to free the returned object.
  *
  * Return NULL if the pkey is NULL, malformed or if the length is 0. */
 crypto_pk_t *

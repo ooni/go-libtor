@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -122,7 +122,7 @@ struct rsa_st *crypto_pk_get_openssl_rsa_(crypto_pk_t *env);
 crypto_pk_t *crypto_new_pk_from_openssl_rsa_(struct rsa_st *rsa);
 MOCK_DECL(struct evp_pkey_st *, crypto_pk_get_openssl_evp_pkey_,(
                                  crypto_pk_t *env,int private));
-#endif
+#endif /* defined(ENABLE_OPENSSL) */
 
 #ifdef ENABLE_NSS
 struct SECKEYPublicKeyStr;
@@ -132,7 +132,7 @@ const struct SECKEYPublicKeyStr *crypto_pk_get_nss_pubkey(
                                            const crypto_pk_t *key);
 const struct SECKEYPrivateKeyStr *crypto_pk_get_nss_privkey(
                                            const crypto_pk_t *key);
-#endif
+#endif /* defined(ENABLE_NSS) */
 
 void crypto_pk_assign_public(crypto_pk_t *dest, const crypto_pk_t *src);
 void crypto_pk_assign_private(crypto_pk_t *dest, const crypto_pk_t *src);
@@ -143,6 +143,6 @@ struct SECItemStr;
 STATIC int secitem_uint_cmp(const struct SECItemStr *a,
                             const struct SECItemStr *b);
 #endif
-#endif
+#endif /* defined(TOR_UNIT_TESTS) */
 
-#endif
+#endif /* !defined(TOR_CRYPTO_RSA_H) */

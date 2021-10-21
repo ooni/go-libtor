@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -16,7 +16,7 @@
 #include "lib/log/util_bug.h"
 #include "lib/fs/files.h"
 
-DISABLE_GCC_WARNING(redundant-decls)
+DISABLE_GCC_WARNING("-Wredundant-decls")
 
 #include <openssl/err.h>
 #include <openssl/rsa.h>
@@ -27,7 +27,7 @@ DISABLE_GCC_WARNING(redundant-decls)
 #include <openssl/bn.h>
 #include <openssl/conf.h>
 
-ENABLE_GCC_WARNING(redundant-decls)
+ENABLE_GCC_WARNING("-Wredundant-decls")
 
 #include "lib/log/log.h"
 #include "lib/encoding/binascii.h"
@@ -54,7 +54,7 @@ crypto_pk_key_is_private(const crypto_pk_t *k)
   const BIGNUM *p, *q;
   RSA_get0_factors(k->key, &p, &q);
   return p != NULL; /* XXX/yawning: Should we check q? */
-#else /* !(defined(OPENSSL_1_1_API)) */
+#else /* !defined(OPENSSL_1_1_API) */
   return k && k->key && k->key->p;
 #endif /* defined(OPENSSL_1_1_API) */
 }
@@ -288,7 +288,7 @@ crypto_pk_num_bits(crypto_pk_t *env)
   tor_assert(n != NULL);
 
   return RSA_bits(env->key);
-#else /* !(defined(OPENSSL_1_1_API)) */
+#else /* !defined(OPENSSL_1_1_API) */
   tor_assert(env->key->n);
   return BN_num_bits(env->key->n);
 #endif /* defined(OPENSSL_1_1_API) */
@@ -583,15 +583,15 @@ rsa_private_key_too_long(RSA *rsa, int max_bits)
   dmp1 = RSA_get0_dmp1(rsa);
   dmq1 = RSA_get0_dmq1(rsa);
   iqmp = RSA_get0_iqmp(rsa);
-#else
+#else /* !(OPENSSL_VERSION_NUMBER >= OPENSSL_V_SERIES(1,1,1)) */
   /* The accessors above did not exist in openssl 1.1.0. */
   p = q = dmp1 = dmq1 = iqmp = NULL;
   RSA_get0_key(rsa, &n, &e, &d);
-#endif
+#endif /* OPENSSL_VERSION_NUMBER >= OPENSSL_V_SERIES(1,1,1) */
 
   if (RSA_bits(rsa) > max_bits)
     return true;
-#else
+#else /* !defined(OPENSSL_1_1_API) */
   n = rsa->n;
   e = rsa->e;
   p = rsa->p;
@@ -600,7 +600,7 @@ rsa_private_key_too_long(RSA *rsa, int max_bits)
   dmp1 = rsa->dmp1;
   dmq1 = rsa->dmq1;
   iqmp = rsa->iqmp;
-#endif
+#endif /* defined(OPENSSL_1_1_API) */
 
   if (n && BN_num_bits(n) > max_bits)
     return true;

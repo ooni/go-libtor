@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -10,6 +10,8 @@
 
 #ifndef TOR_TRANSPORTS_H
 #define TOR_TRANSPORTS_H
+
+#include "lib/process/process.h"
 
 /** Represents a pluggable transport used by a bridge. */
 typedef struct transport_t {
@@ -39,6 +41,7 @@ void transport_free_(transport_t *transport);
 #define transport_free(tr) FREE_AND_NULL(transport_t, transport_free_, (tr))
 
 MOCK_DECL(transport_t*, transport_get_by_name, (const char *name));
+bool managed_proxy_has_transport(const char *transport_name);
 
 MOCK_DECL(void, pt_kickstart_proxy,
           (const smartlist_t *transport_list, char **proxy_argv,
@@ -81,7 +84,7 @@ enum pt_proto_state {
   PT_PROTO_FAILED_LAUNCH /* failed while launching */
 };
 
-struct process_handle_t;
+struct process_t;
 
 /** Structure containing information of a managed proxy. */
 typedef struct {
@@ -94,10 +97,8 @@ typedef struct {
 
   int is_server; /* is it a server proxy? */
 
-  /* A pointer to the process handle of this managed proxy. */
-  struct process_handle_t *process_handle;
-
-  int pid; /* The Process ID this managed proxy is using. */
+  /* A pointer to the process of this managed proxy. */
+  struct process_t *process;
 
   /** Boolean: We are re-parsing our config, and we are going to
    * remove this managed proxy if we don't find it any transport
@@ -128,6 +129,8 @@ STATIC int parse_version(const char *line, managed_proxy_t *mp);
 STATIC void parse_env_error(const char *line);
 STATIC void parse_proxy_error(const char *line);
 STATIC void handle_proxy_line(const char *line, managed_proxy_t *mp);
+STATIC void parse_log_line(const char *line, managed_proxy_t *mp);
+STATIC void parse_status_line(const char *line, managed_proxy_t *mp);
 STATIC char *get_transport_options_for_server_proxy(const managed_proxy_t *mp);
 
 STATIC void managed_proxy_destroy(managed_proxy_t *mp,
@@ -141,6 +144,14 @@ STATIC int configure_proxy(managed_proxy_t *mp);
 STATIC char* get_pt_proxy_uri(void);
 
 STATIC void free_execve_args(char **arg);
+
+STATIC void managed_proxy_stdout_callback(process_t *, const char *, size_t);
+STATIC void managed_proxy_stderr_callback(process_t *, const char *, size_t);
+STATIC bool managed_proxy_exit_callback(process_t *, process_exit_code_t);
+
+STATIC int managed_proxy_severity_parse(const char *);
+STATIC const tor_addr_t *managed_proxy_outbound_address(const or_options_t *,
+                                                        sa_family_t);
 
 #endif /* defined(PT_PRIVATE) */
 

@@ -1,13 +1,19 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
+
+/**
+ * @file dircache.c
+ * @brief Cache directories and serve them to clients.
+ **/
 
 #define DIRCACHE_PRIVATE
 
 #include "core/or/or.h"
 
 #include "app/config/config.h"
+#include "app/config/resolve_addr.h"
 #include "core/mainloop/connection.h"
 #include "core/or/relay.h"
 #include "feature/dirauth/dirvote.h"
@@ -23,8 +29,8 @@
 #include "feature/nodelist/authcert.h"
 #include "feature/nodelist/networkstatus.h"
 #include "feature/nodelist/routerlist.h"
+#include "feature/relay/relay_config.h"
 #include "feature/relay/routermode.h"
-#include "feature/rend/rendcache.h"
 #include "feature/stats/geoip_stats.h"
 #include "feature/stats/rephist.h"
 #include "lib/compress/compress.h"
@@ -49,7 +55,8 @@
 #define ROUTERDESC_BY_DIGEST_CACHE_LIFETIME (48*60*60)
 #define ROBOTS_CACHE_LIFETIME (24*60*60)
 #define MICRODESC_CACHE_LIFETIME (48*60*60)
-
+/* Bandwidth files change every hour. */
+#define BANDWIDTH_CACHE_LIFETIME (30*60)
 /** Parse an HTTP request string <b>headers</b> of the form
  * \verbatim
  * "\%s [http[s]://]\%s HTTP/1..."
@@ -123,7 +130,7 @@ write_http_response_header_impl(dir_connection_t *conn, ssize_t length,
                            long cache_lifetime)
 {
   char date[RFC1123_TIME_LEN+1];
-  time_t now = time(NULL);
+  time_t now = approx_time();
   buf_t *buf = buf_new_with_capacity(1024);
 
   tor_assert(conn);
@@ -134,7 +141,7 @@ write_http_response_header_impl(dir_connection_t *conn, ssize_t length,
   if (type) {
     buf_add_printf(buf, "Content-Type: %s\r\n", type);
   }
-  if (!is_local_addr(&conn->base_.addr)) {
+  if (!is_local_to_resolve_addr(&conn->base_.addr)) {
     /* Don't report the source address for a nearby/private connection.
      * Otherwise we tend to mis-report in cases where incoming ports are
      * being forwarded to a Tor server running behind the firewall. */
@@ -166,22 +173,16 @@ write_http_response_header_impl(dir_connection_t *conn, ssize_t length,
   buf_free(buf);
 }
 
-/** As write_http_response_header_impl, but sets encoding and content-typed
- * based on whether the response will be <b>compressed</b> or not. */
+/** As write_http_response_header_impl, but translates method into
+ * encoding */
 static void
 write_http_response_headers(dir_connection_t *conn, ssize_t length,
                             compress_method_t method,
                             const char *extra_headers, long cache_lifetime)
 {
-  const char *methodname = compression_method_get_name(method);
-  const char *doctype;
-  if (method == NO_METHOD)
-    doctype = "text/plain";
-  else
-    doctype = "application/octet-stream";
   write_http_response_header_impl(conn, length,
-                                  doctype,
-                                  methodname,
+                                  "text/plain",
+                                  compression_method_get_name(method),
                                   extra_headers,
                                   cache_lifetime);
 }
@@ -294,19 +295,22 @@ client_likes_consensus(const struct consensus_cache_entry_t *ent,
 /** Return the compression level we should use for sending a compressed
  * response of size <b>n_bytes</b>. */
 STATIC compression_level_t
-choose_compression_level(ssize_t n_bytes)
+choose_compression_level(void)
 {
-  if (! have_been_under_memory_pressure()) {
-    return HIGH_COMPRESSION; /* we have plenty of RAM. */
-  } else if (n_bytes < 0) {
-    return HIGH_COMPRESSION; /* unknown; might be big. */
-  } else if (n_bytes < 1024) {
-    return LOW_COMPRESSION;
-  } else if (n_bytes < 2048) {
-    return MEDIUM_COMPRESSION;
-  } else {
-    return HIGH_COMPRESSION;
-  }
+  /* This is the compression level choice for a stream.
+   *
+   * We always return LOW because this compression is done in the main thread
+   * thus we save CPU time as much as possible, and it is also done more than
+   * background compression for document we serve pre-compressed.
+   *
+   * GZip highest compression level (9) gives us a ratio of 49.72%
+   * Zstd lowest compression level (1) gives us a ratio of 47.38%
+   *
+   * Thus, as the network moves more and more to use Zstd when requesting
+   * directory documents that are not pre-cached, even at the
+   * lowest level, we still gain over GZip and thus help with load and CPU
+   * time on the network. */
+  return LOW_COMPRESSION;
 }
 
 /** Information passed to handle a GET request. */
@@ -333,7 +337,7 @@ typedef struct get_handler_args_t {
  * an arguments structure, and must return 0 on success or -1 if we should
  * close the connection.
  **/
-typedef struct url_table_ent_s {
+typedef struct url_table_ent_t {
   const char *string;
   int is_prefix;
   int (*handler)(dir_connection_t *conn, const get_handler_args_t *args);
@@ -351,24 +355,24 @@ static int handle_get_descriptor(dir_connection_t *conn,
                                 const get_handler_args_t *args);
 static int handle_get_keys(dir_connection_t *conn,
                                 const get_handler_args_t *args);
-static int handle_get_hs_descriptor_v2(dir_connection_t *conn,
-                                       const get_handler_args_t *args);
 static int handle_get_robots(dir_connection_t *conn,
                                 const get_handler_args_t *args);
 static int handle_get_networkstatus_bridges(dir_connection_t *conn,
                                 const get_handler_args_t *args);
+static int handle_get_next_bandwidth(dir_connection_t *conn,
+                                     const get_handler_args_t *args);
 
 /** Table for handling GET requests. */
 static const url_table_ent_t url_table[] = {
   { "/tor/", 0, handle_get_frontpage },
   { "/tor/status-vote/current/consensus", 1, handle_get_current_consensus },
   { "/tor/status-vote/current/", 1, handle_get_status_vote },
+  { "/tor/status-vote/next/bandwidth", 0, handle_get_next_bandwidth },
   { "/tor/status-vote/next/", 1, handle_get_status_vote },
   { "/tor/micro/d/", 1, handle_get_microdesc },
   { "/tor/server/", 1, handle_get_descriptor },
   { "/tor/extra/", 1, handle_get_descriptor },
   { "/tor/keys/", 1, handle_get_keys },
-  { "/tor/rendezvous2/", 1, handle_get_hs_descriptor_v2 },
   { "/tor/hs/3/", 1, handle_get_hs_descriptor_v3 },
   { "/tor/robots.txt", 0, handle_get_robots },
   { "/tor/networkstatus-bridges", 0, handle_get_networkstatus_bridges },
@@ -475,7 +479,7 @@ static int
 handle_get_frontpage(dir_connection_t *conn, const get_handler_args_t *args)
 {
   (void) args; /* unused */
-  const char *frontpage = get_dirportfrontpage();
+  const char *frontpage = relay_get_dirportfrontpage();
 
   if (frontpage) {
     size_t dlen;
@@ -495,28 +499,47 @@ handle_get_frontpage(dir_connection_t *conn, const get_handler_args_t *args)
 }
 
 /** Warn that the cached consensus <b>consensus</b> of type
- * <b>flavor</b> is too old and will not be served to clients. Rate-limit the
- * warning to avoid logging an entry on every request.
+ * <b>flavor</b> too new or too old, based on <b>is_too_new</b>,
+ * and will not be served to clients. Rate-limit the warning to avoid logging
+ * an entry on every request.
  */
 static void
-warn_consensus_is_too_old(const struct consensus_cache_entry_t *consensus,
-                          const char *flavor, time_t now)
+warn_consensus_is_not_reasonably_live(
+                          const struct consensus_cache_entry_t *consensus,
+                          const char *flavor, time_t now, bool is_too_new)
 {
-#define TOO_OLD_WARNING_INTERVAL (60*60)
-  static ratelim_t warned = RATELIM_INIT(TOO_OLD_WARNING_INTERVAL);
+#define NOT_REASONABLY_LIVE_WARNING_INTERVAL (60*60)
+  static ratelim_t warned[2] = { RATELIM_INIT(
+                                      NOT_REASONABLY_LIVE_WARNING_INTERVAL),
+                                RATELIM_INIT(
+                                      NOT_REASONABLY_LIVE_WARNING_INTERVAL) };
   char timestamp[ISO_TIME_LEN+1];
-  time_t valid_until;
-  char *dupes;
+  /* valid_after if is_too_new, valid_until if !is_too_new */
+  time_t valid_time = 0;
+  char *dupes = NULL;
 
-  if (consensus_cache_entry_get_valid_until(consensus, &valid_until))
-    return;
+  if (is_too_new) {
+    if (consensus_cache_entry_get_valid_after(consensus, &valid_time))
+      return;
+    dupes = rate_limit_log(&warned[1], now);
+  } else {
+    if (consensus_cache_entry_get_valid_until(consensus, &valid_time))
+      return;
+    dupes = rate_limit_log(&warned[0], now);
+  }
 
-  if ((dupes = rate_limit_log(&warned, now))) {
-    format_local_iso_time(timestamp, valid_until);
-    log_warn(LD_DIRSERV, "Our %s%sconsensus is too old, so we will not "
-             "serve it to clients. It was valid until %s local time and we "
-             "continued to serve it for up to 24 hours after it expired.%s",
-             flavor ? flavor : "", flavor ? " " : "", timestamp, dupes);
+  if (dupes) {
+    format_local_iso_time(timestamp, valid_time);
+    log_warn(LD_DIRSERV, "Our %s%sconsensus is too %s, so we will not "
+             "serve it to clients. It was valid %s %s local time and we "
+             "continued to serve it for up to 24 hours %s.%s",
+             flavor ? flavor : "",
+             flavor ? " " : "",
+             is_too_new ? "new" : "old",
+             is_too_new ? "after" : "until",
+             timestamp,
+             is_too_new ? "before it was valid" : "after it expired",
+             dupes);
     tor_free(dupes);
   }
 }
@@ -543,7 +566,7 @@ parse_one_diff_hash(uint8_t *digest, const char *hex, const char *location,
 }
 
 /** If there is an X-Or-Diff-From-Consensus header included in <b>headers</b>,
- * set <b>digest_out<b> to a new smartlist containing every 256-bit
+ * set <b>digest_out</b> to a new smartlist containing every 256-bit
  * hex-encoded digest listed in that header and return 0.  Otherwise return
  * -1.  */
 static int
@@ -711,7 +734,7 @@ digest_list_contains_best_consensus(consensus_flavor_t flavor,
 typedef struct {
   /** name of the flavor to retrieve. */
   char *flavor;
-  /** flavor to retrive, as enum. */
+  /** flavor to retrieve, as enum. */
   consensus_flavor_t flav;
   /** plus-separated list of authority fingerprints; see
    * client_likes_consensus(). Aliases the URL in the request passed to
@@ -859,7 +882,6 @@ handle_get_current_consensus(dir_connection_t *conn,
 
   if (req.diff_only && !cached_consensus) {
     write_short_http_response(conn, 404, "No such diff available");
-    // XXXX warn_consensus_is_too_old(v, req.flavor, now);
     geoip_note_ns_response(GEOIP_REJECT_NOT_FOUND);
     goto done;
   }
@@ -870,19 +892,30 @@ handle_get_current_consensus(dir_connection_t *conn,
                                            &compression_used);
   }
 
-  time_t fresh_until, valid_until;
-  int have_fresh_until = 0, have_valid_until = 0;
+  time_t valid_after, fresh_until, valid_until;
+  int have_valid_after = 0, have_fresh_until = 0, have_valid_until = 0;
   if (cached_consensus) {
+    have_valid_after =
+      !consensus_cache_entry_get_valid_after(cached_consensus, &valid_after);
     have_fresh_until =
       !consensus_cache_entry_get_fresh_until(cached_consensus, &fresh_until);
     have_valid_until =
       !consensus_cache_entry_get_valid_until(cached_consensus, &valid_until);
   }
 
-  if (cached_consensus && have_valid_until &&
+  if (cached_consensus && have_valid_after &&
+      !networkstatus_valid_after_is_reasonably_live(valid_after, now)) {
+    write_short_http_response(conn, 404, "Consensus is too new");
+    warn_consensus_is_not_reasonably_live(cached_consensus, req.flavor, now,
+                                          1);
+    geoip_note_ns_response(GEOIP_REJECT_NOT_FOUND);
+    goto done;
+  } else if (
+      cached_consensus && have_valid_until &&
       !networkstatus_valid_until_is_reasonably_live(valid_until, now)) {
     write_short_http_response(conn, 404, "Consensus is too old");
-    warn_consensus_is_too_old(cached_consensus, req.flavor, now);
+    warn_consensus_is_not_reasonably_live(cached_consensus, req.flavor, now,
+                                          0);
     geoip_note_ns_response(GEOIP_REJECT_NOT_FOUND);
     goto done;
   }
@@ -924,7 +957,7 @@ handle_get_current_consensus(dir_connection_t *conn,
     goto done;
   }
 
-  if (global_write_bucket_low(TO_CONN(conn), size_guess, 2)) {
+  if (connection_dir_is_global_write_low(TO_CONN(conn), size_guess)) {
     log_debug(LD_DIRSERV,
               "Client asked for network status lists, but we've been "
               "writing too many bytes lately. Sending 503 Dir busy.");
@@ -1033,7 +1066,7 @@ handle_get_status_vote(dir_connection_t *conn, const get_handler_args_t *args)
         }
       });
 
-    if (global_write_bucket_low(TO_CONN(conn), estimated_len, 2)) {
+    if (connection_dir_is_global_write_low(TO_CONN(conn), estimated_len)) {
       write_short_http_response(conn, 503, "Directory busy, try again later");
       goto vote_done;
     }
@@ -1044,14 +1077,12 @@ handle_get_status_vote(dir_connection_t *conn, const get_handler_args_t *args)
     if (smartlist_len(items)) {
       if (compress_method != NO_METHOD) {
         conn->compress_state = tor_compress_new(1, compress_method,
-                           choose_compression_level(estimated_len));
-        SMARTLIST_FOREACH(items, const char *, c,
-                 connection_buf_add_compress(c, strlen(c), conn, 0));
-        connection_buf_add_compress("", 0, conn, 1);
-      } else {
-        SMARTLIST_FOREACH(items, const char *, c,
-                         connection_buf_add(c, strlen(c), TO_CONN(conn)));
+                           choose_compression_level());
       }
+
+      SMARTLIST_FOREACH(items, const char *, c,
+                        connection_dir_buf_add(c, strlen(c), conn,
+                                               c_sl_idx == c_sl_len - 1));
     } else {
       SMARTLIST_FOREACH(dir_items, cached_dir_t *, d,
           connection_buf_add(compress_method != NO_METHOD ?
@@ -1094,7 +1125,7 @@ handle_get_microdesc(dir_connection_t *conn, const get_handler_args_t *args)
       write_short_http_response(conn, 404, "Not found");
       goto done;
     }
-    if (global_write_bucket_low(TO_CONN(conn), size_guess, 2)) {
+    if (connection_dir_is_global_write_low(TO_CONN(conn), size_guess)) {
       log_info(LD_DIRSERV,
                "Client asked for server descriptors, but we've been "
                "writing too many bytes lately. Sending 503 Dir busy.");
@@ -1109,7 +1140,7 @@ handle_get_microdesc(dir_connection_t *conn, const get_handler_args_t *args)
 
     if (compress_method != NO_METHOD)
       conn->compress_state = tor_compress_new(1, compress_method,
-                                      choose_compression_level(size_guess));
+                                      choose_compression_level());
 
     const int initial_flush_result = connection_dirserv_flushed_some(conn);
     tor_assert_nonfatal(initial_flush_result == 0);
@@ -1192,7 +1223,7 @@ handle_get_descriptor(dir_connection_t *conn, const get_handler_args_t *args)
         msg = "Not found";
       write_short_http_response(conn, 404, msg);
     } else {
-      if (global_write_bucket_low(TO_CONN(conn), size_guess, 2)) {
+      if (connection_dir_is_global_write_low(TO_CONN(conn), size_guess)) {
         log_info(LD_DIRSERV,
                  "Client asked for server descriptors, but we've been "
                  "writing too many bytes lately. Sending 503 Dir busy.");
@@ -1204,7 +1235,7 @@ handle_get_descriptor(dir_connection_t *conn, const get_handler_args_t *args)
       write_http_response_header(conn, -1, compress_method, cache_lifetime);
       if (compress_method != NO_METHOD)
         conn->compress_state = tor_compress_new(1, compress_method,
-                                        choose_compression_level(size_guess));
+                                        choose_compression_level());
       clear_spool = 0;
       /* Prime the connection with some data. */
       int initial_flush_result = connection_dirserv_flushed_some(conn);
@@ -1288,9 +1319,8 @@ handle_get_keys(dir_connection_t *conn, const get_handler_args_t *args)
     SMARTLIST_FOREACH(certs, authority_cert_t *, c,
                       len += c->cache_info.signed_descriptor_len);
 
-    if (global_write_bucket_low(TO_CONN(conn),
-                                compress_method != NO_METHOD ? len/2 : len,
-                                2)) {
+    if (connection_dir_is_global_write_low(TO_CONN(conn),
+                                compress_method != NO_METHOD ? len/2 : len)) {
       write_short_http_response(conn, 503, "Directory busy, try again later");
       goto keys_done;
     }
@@ -1301,20 +1331,14 @@ handle_get_keys(dir_connection_t *conn, const get_handler_args_t *args)
                                60*60);
     if (compress_method != NO_METHOD) {
       conn->compress_state = tor_compress_new(1, compress_method,
-                                              choose_compression_level(len));
-      SMARTLIST_FOREACH(certs, authority_cert_t *, c,
-            connection_buf_add_compress(
-                c->cache_info.signed_descriptor_body,
-                c->cache_info.signed_descriptor_len,
-                conn, 0));
-      connection_buf_add_compress("", 0, conn, 1);
-    } else {
-      SMARTLIST_FOREACH(certs, authority_cert_t *, c,
-            connection_buf_add(c->cache_info.signed_descriptor_body,
-                                    c->cache_info.signed_descriptor_len,
-                                    TO_CONN(conn)));
+                                              choose_compression_level());
     }
-  keys_done:
+
+    SMARTLIST_FOREACH(certs, authority_cert_t *, c,
+          connection_dir_buf_add(c->cache_info.signed_descriptor_body,
+                                 c->cache_info.signed_descriptor_len,
+                                 conn, c_sl_idx == c_sl_len - 1));
+ keys_done:
     smartlist_free(certs);
     goto done;
   }
@@ -1322,45 +1346,7 @@ handle_get_keys(dir_connection_t *conn, const get_handler_args_t *args)
   return 0;
 }
 
-/** Helper function for GET /tor/rendezvous2/
- */
-static int
-handle_get_hs_descriptor_v2(dir_connection_t *conn,
-                            const get_handler_args_t *args)
-{
-  const char *url = args->url;
-  if (connection_dir_is_encrypted(conn)) {
-    /* Handle v2 rendezvous descriptor fetch request. */
-    const char *descp;
-    const char *query = url + strlen("/tor/rendezvous2/");
-    if (rend_valid_descriptor_id(query)) {
-      log_info(LD_REND, "Got a v2 rendezvous descriptor request for ID '%s'",
-               safe_str(escaped(query)));
-      switch (rend_cache_lookup_v2_desc_as_dir(query, &descp)) {
-        case 1: /* valid */
-          write_http_response_header(conn, strlen(descp), NO_METHOD, 0);
-          connection_buf_add(descp, strlen(descp), TO_CONN(conn));
-          break;
-        case 0: /* well-formed but not present */
-          write_short_http_response(conn, 404, "Not found");
-          break;
-        case -1: /* not well-formed */
-          write_short_http_response(conn, 400, "Bad request");
-          break;
-      }
-    } else { /* not well-formed */
-      write_short_http_response(conn, 400, "Bad request");
-    }
-    goto done;
-  } else {
-    /* Not encrypted! */
-    write_short_http_response(conn, 404, "Not found");
-  }
- done:
-  return 0;
-}
-
-/** Helper function for GET /tor/hs/3/<z>. Only for version 3.
+/** Helper function for GET `/tor/hs/3/...`. Only for version 3.
  */
 STATIC int
 handle_get_hs_descriptor_v3(dir_connection_t *conn,
@@ -1371,9 +1357,11 @@ handle_get_hs_descriptor_v3(dir_connection_t *conn,
   const char *pubkey_str = NULL;
   const char *url = args->url;
 
-  /* Reject unencrypted dir connections */
-  if (!connection_dir_is_encrypted(conn)) {
-    write_short_http_response(conn, 404, "Not found");
+  /* Reject non anonymous dir connections (which also tests if encrypted). We
+   * do not allow single hop clients to query an HSDir. */
+  if (!connection_dir_is_anonymous(conn)) {
+    write_short_http_response(conn, 503,
+                              "Rejecting single hop HS v3 descriptor request");
     goto done;
   }
 
@@ -1435,6 +1423,39 @@ handle_get_networkstatus_bridges(dir_connection_t *conn,
     goto done;
   }
  done:
+  return 0;
+}
+
+/** Helper function for GET the bandwidth file used for the next vote */
+static int
+handle_get_next_bandwidth(dir_connection_t *conn,
+                          const get_handler_args_t *args)
+{
+  log_debug(LD_DIR, "Getting next bandwidth.");
+  const or_options_t *options = get_options();
+  const compress_method_t compress_method =
+    find_best_compression_method(args->compression_supported, 1);
+
+  if (options->V3BandwidthsFile) {
+    char *bandwidth = read_file_to_str(options->V3BandwidthsFile,
+                                       RFTS_IGNORE_MISSING, NULL);
+    if (bandwidth != NULL) {
+      ssize_t len = strlen(bandwidth);
+      write_http_response_header(conn, compress_method != NO_METHOD ? -1 : len,
+                                 compress_method, BANDWIDTH_CACHE_LIFETIME);
+      if (compress_method != NO_METHOD) {
+        conn->compress_state = tor_compress_new(1, compress_method,
+                                        choose_compression_level());
+        log_debug(LD_DIR, "Compressing bandwidth file.");
+      } else {
+        log_debug(LD_DIR, "Not compressing bandwidth file.");
+      }
+      connection_dir_buf_add((const char*)bandwidth, len, conn, 1);
+      tor_free(bandwidth);
+      return 0;
+    }
+  }
+  write_short_http_response(conn, 404, "Not found");
   return 0;
 }
 
@@ -1554,7 +1575,8 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
 
   if (!public_server_mode(options)) {
     log_info(LD_DIR, "Rejected dir post request from %s "
-             "since we're not a public relay.", conn->base_.address);
+             "since we're not a public relay.",
+             connection_describe_peer(TO_CONN(conn)));
     write_short_http_response(conn, 503, "Not acting as a public relay");
     goto done;
   }
@@ -1565,25 +1587,15 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
   }
   log_debug(LD_DIRSERV,"rewritten url as '%s'.", escaped(url));
 
-  /* Handle v2 rendezvous service publish request. */
-  if (connection_dir_is_encrypted(conn) &&
-      !strcmpstart(url,"/tor/rendezvous2/publish")) {
-    if (rend_cache_store_v2_desc_as_dir(body) < 0) {
-      log_warn(LD_REND, "Rejected v2 rend descriptor (body size %d) from %s.",
-               (int)body_len, conn->base_.address);
-      write_short_http_response(conn, 400,
-                             "Invalid v2 service descriptor rejected");
-    } else {
-      write_short_http_response(conn, 200, "Service descriptor (v2) stored");
-      log_info(LD_REND, "Handled v2 rendezvous descriptor post: accepted");
+  /* Handle HS descriptor publish request. We force an anonymous connection
+   * (which also tests for encrypted). We do not allow single-hop client to
+   * post a descriptor onto an HSDir. */
+  if (!strcmpstart(url, "/tor/hs/")) {
+    if (!connection_dir_is_anonymous(conn)) {
+      write_short_http_response(conn, 503,
+                                "Rejecting single hop HS descriptor post");
+      goto done;
     }
-    goto done;
-  }
-
-  /* Handle HS descriptor publish request. */
-  /* XXX: This should be disabled with a consensus param until we want to
-   * the prop224 be deployed and thus use. */
-  if (connection_dir_is_encrypted(conn) && !strcmpstart(url, "/tor/hs/")) {
     const char *msg = "HS descriptor stored successfully.";
 
     /* We most probably have a publish request for an HS descriptor. */
@@ -1608,8 +1620,17 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
     const char *msg = "[None]";
     uint8_t purpose = authdir_mode_bridge(options) ?
                       ROUTER_PURPOSE_BRIDGE : ROUTER_PURPOSE_GENERAL;
-    was_router_added_t r = dirserv_add_multiple_descriptors(body, purpose,
-                                             conn->base_.address, &msg);
+
+    {
+      char *genreason = http_get_header(headers, "X-Desc-Gen-Reason: ");
+      log_info(LD_DIRSERV,
+               "New descriptor post, because: %s",
+               genreason ? genreason : "not specified");
+      tor_free(genreason);
+    }
+
+    was_router_added_t r = dirserv_add_multiple_descriptors(body, body_len,
+                                           purpose, conn->base_.address, &msg);
     tor_assert(msg);
 
     if (r == ROUTER_ADDED_SUCCESSFULLY) {
@@ -1621,7 +1642,8 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
       log_info(LD_DIRSERV,
                "Rejected router descriptor or extra-info from %s "
                "(\"%s\").",
-               conn->base_.address, msg);
+               connection_describe_peer(TO_CONN(conn)),
+               msg);
       write_short_http_response(conn, 400, msg);
     }
     goto done;
@@ -1631,12 +1653,14 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
       !strcmp(url,"/tor/post/vote")) { /* v3 networkstatus vote */
     const char *msg = "OK";
     int status;
-    if (dirvote_add_vote(body, &msg, &status)) {
+    if (dirvote_add_vote(body, approx_time(), TO_CONN(conn)->address,
+                         &msg, &status)) {
       write_short_http_response(conn, status, "Vote stored");
     } else {
       tor_assert(msg);
       log_warn(LD_DIRSERV, "Rejected vote from %s (\"%s\").",
-               conn->base_.address, msg);
+               connection_describe_peer(TO_CONN(conn)),
+               msg);
       write_short_http_response(conn, status, msg);
     }
     goto done;
@@ -1649,7 +1673,8 @@ directory_handle_command_post,(dir_connection_t *conn, const char *headers,
       write_short_http_response(conn, 200, msg?msg:"Signatures stored");
     } else {
       log_warn(LD_DIR, "Unable to store signatures posted by %s: %s",
-               conn->base_.address, msg?msg:"???");
+               connection_describe_peer(TO_CONN(conn)),
+               msg?msg:"???");
       write_short_http_response(conn, 400,
                                 msg?msg:"Unable to store signatures");
     }
@@ -1710,8 +1735,8 @@ directory_handle_command(dir_connection_t *conn)
                               &body, &body_len, MAX_DIR_UL_SIZE, 0)) {
     case -1: /* overflow */
       log_warn(LD_DIRSERV,
-               "Request too large from address '%s' to DirPort. Closing.",
-               safe_str(conn->base_.address));
+               "Request too large from %s to DirPort. Closing.",
+               connection_describe_peer(TO_CONN(conn)));
       return -1;
     case 0:
       log_debug(LD_DIRSERV,"command not all here yet.");

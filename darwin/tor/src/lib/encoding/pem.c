@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -42,7 +42,7 @@ pem_encoded_size(size_t src_len, const char *objtype)
 
 /**
  * PEM-encode the <b>srclen</b>-byte object at <b>src</b> into the
- * <b>destlen<\b>-byte buffer at <b>dest</b>, tagging it with <b>objtype</b>.
+ * <b>destlen</b>-byte buffer at <b>dest</b>, tagging it with <b>objtype</b>.
  * Return 0 on success and -1 on failure.
  */
 int

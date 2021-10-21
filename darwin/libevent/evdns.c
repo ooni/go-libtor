@@ -209,6 +209,7 @@ struct request {
 	u16 trans_id;  /* the transaction id */
 	unsigned request_appended :1;	/* true if the request pointer is data which follows this struct */
 	unsigned transmit_me :1;  /* needs to be transmitted */
+	unsigned need_cname :1;   /* make a separate callback for CNAME */
 
 	/* XXXX This is a horrible hack. */
 	char **put_cname_in_ptr; /* store the cname here if we get one. */
@@ -228,6 +229,7 @@ struct reply {
 		char *ptr_name;
 		void *raw;
 	} data;
+	char *cname;
 };
 
 enum tcp_state {
@@ -986,12 +988,15 @@ reply_run_callback(struct event_callback *d, void *user_pointer)
 
 	switch (cb->request_type) {
 	case TYPE_A:
-		if (cb->have_reply)
+		if (cb->have_reply) {
 			cb->user_callback(DNS_ERR_NONE, DNS_IPv4_A,
 			    cb->reply.rr_count, cb->ttl,
 			    cb->reply.data.a,
 			    user_pointer);
-		else
+			if (cb->reply.cname)
+				cb->user_callback(DNS_ERR_NONE, DNS_CNAME, 1,
+				    cb->ttl, cb->reply.cname, user_pointer);
+		} else
 			cb->user_callback(cb->err, 0, 0, cb->ttl, NULL, user_pointer);
 		break;
 	case TYPE_PTR:
@@ -1004,12 +1009,15 @@ reply_run_callback(struct event_callback *d, void *user_pointer)
 		}
 		break;
 	case TYPE_AAAA:
-		if (cb->have_reply)
+		if (cb->have_reply) {
 			cb->user_callback(DNS_ERR_NONE, DNS_IPv6_AAAA,
 			    cb->reply.rr_count, cb->ttl,
 			    cb->reply.data.aaaa,
 			    user_pointer);
-		else
+			if (cb->reply.cname)
+				cb->user_callback(DNS_ERR_NONE, DNS_CNAME, 1,
+				    cb->ttl, cb->reply.cname, user_pointer);
+		} else
 			cb->user_callback(cb->err, 0, 0, cb->ttl, NULL, user_pointer);
 		break;
 	default:
@@ -1022,6 +1030,10 @@ reply_run_callback(struct event_callback *d, void *user_pointer)
 
 	if (cb->reply.data.raw) {
 		mm_free(cb->reply.data.raw);
+	}
+
+	if (cb->reply.cname) {
+		mm_free(cb->reply.cname);
 	}
 
 	mm_free(cb);
@@ -1383,13 +1395,13 @@ reply_parse(struct evdns_base *base, u8 *packet, int length)
 			break;
 		} else if (type == TYPE_CNAME) {
 			char cname[HOST_NAME_MAX];
-			if (!req->put_cname_in_ptr || *req->put_cname_in_ptr) {
-				j += datalength; continue;
-			}
 			if (name_parse(packet, length, &j, cname,
 				sizeof(cname))<0)
 				goto err;
-			*req->put_cname_in_ptr = mm_strdup(cname);
+			if (req->need_cname)
+				reply.cname = mm_strdup(cname);
+			if (req->put_cname_in_ptr && !*req->put_cname_in_ptr)
+				*req->put_cname_in_ptr = mm_strdup(cname);
 		} else if (type == TYPE_AAAA && class == CLASS_INET) {
 			int addrcount;
 			if (req->request_type != TYPE_AAAA) {
@@ -1593,17 +1605,6 @@ err:
 #undef GET32
 #undef GET16
 #undef GET8
-}
-
-
-void
-evdns_set_transaction_id_fn(ev_uint16_t (*fn)(void))
-{
-}
-
-void
-evdns_set_random_bytes_fn(void (*fn)(char *, size_t))
-{
 }
 
 /* Try to choose a strong transaction id which isn't already in flight */
@@ -3324,6 +3325,9 @@ evdns_base_nameserver_add(struct evdns_base *base, unsigned long int address)
 	sin.sin_addr.s_addr = address;
 	sin.sin_port = htons(53);
 	sin.sin_family = AF_INET;
+#ifdef EVENT__HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
+	sin.sin_len = sizeof(sin);
+#endif
 	EVDNS_LOCK(base);
 	res = evdns_nameserver_add_impl_(base, (struct sockaddr*)&sin, sizeof(sin));
 	EVDNS_UNLOCK(base);
@@ -3565,6 +3569,9 @@ request_new(struct evdns_base *base, struct evdns_request *handle, int type,
 		handle->current_req = req;
 		handle->base = base;
 	}
+
+	if (flags & DNS_CNAME_CALLBACK)
+		req->need_cname = 1;
 
 	return req;
 err1:
@@ -5417,6 +5424,9 @@ evdns_getaddrinfo_gotresolve(int result, char type, int count,
 		memset(&sin, 0, sizeof(sin));
 		sin.sin_family = AF_INET;
 		sin.sin_port = htons(data->port);
+#ifdef EVENT__HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
+		sin.sin_len = sizeof(sin);
+#endif
 
 		sa = (struct sockaddr *)&sin;
 		socklen = sizeof(sin);
@@ -5426,6 +5436,9 @@ evdns_getaddrinfo_gotresolve(int result, char type, int count,
 		memset(&sin6, 0, sizeof(sin6));
 		sin6.sin6_family = AF_INET6;
 		sin6.sin6_port = htons(data->port);
+#ifdef EVENT__HAVE_STRUCT_SOCKADDR_IN6_SIN6_LEN
+		sin6.sin6_len = sizeof(sin6);
+#endif
 
 		sa = (struct sockaddr *)&sin6;
 		socklen = sizeof(sin6);
