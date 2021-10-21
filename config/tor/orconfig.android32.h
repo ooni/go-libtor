@@ -14,12 +14,20 @@
 /* tor's build directory */
 #define BUILDDIR ""
 
+/* Compiler name */
+#define COMPILER /**/
+
+/* Compiler vendor */
+#define COMPILER_VENDOR "clang"
+
+/* Compiler version */
+#define COMPILER_VERSION "12.0.0"
+
 /* tor's configuration directory */
 #define CONFDIR ""
 
-#define SHARE_DATADIR ""
-
-#define LOCALSTATEDIR ""
+/* Flags passed to configure */
+#define CONFIG_FLAGS "--disable-asciidoc"
 
 /* Enable smartlist debugging */
 /* #undef DEBUG_SMARTLIST */
@@ -741,7 +749,7 @@
 #define SIZEOF___INT64 0
 
 /* tor's sourcedir directory */
-#define SRCDIR "/Users/art/code/Tor/tor"
+#define SRCDIR ""
 
 /* Set to 1 if we can compile a simple stdatomic example. */
 #define STDATOMIC_WORKS 1
