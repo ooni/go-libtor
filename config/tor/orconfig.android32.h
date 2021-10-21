@@ -29,6 +29,10 @@
 /* Flags passed to configure */
 #define CONFIG_FLAGS "--disable-asciidoc"
 
+#define SHARE_DATADIR ""
+
+#define LOCALSTATEDIR ""
+
 /* Enable smartlist debugging */
 /* #undef DEBUG_SMARTLIST */
 
