@@ -712,7 +712,7 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 	if lock != nil {
 		checkout = lock.Tor
 	} else {
-		checkout = "tor-0.4.6.7"
+		checkout = "release-0.4.6"
 	}
 	checkouter := exec.Command("git", "checkout", checkout)
 	checkouter.Dir = tgtf
