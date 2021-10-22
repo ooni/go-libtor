@@ -761,7 +761,7 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 		fmt.Println(string(out))
 		return "", "", err
 	}
-	deps := regexp.MustCompile("(?m)([a-z0-9_/-]+)\\.c$").FindAllStringSubmatch(string(out), -1)
+	deps := regexp.MustCompile("(?m)([a-z0-9_/-]+)\\.c").FindAllStringSubmatch(string(out), -1)
 
 	// Wipe everything from the library that's non-essential
 	files, err := ioutil.ReadDir(tgtf)
