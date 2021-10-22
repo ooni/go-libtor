@@ -27,7 +27,7 @@
 #define CONFDIR ""
 
 /* Flags passed to configure */
-#define CONFIG_FLAGS "--disable-asciidoc"
+#define CONFIG_FLAGS "--disable-asciidoc --disable-lzma"
 
 #define SHARE_DATADIR ""
 
@@ -258,10 +258,10 @@
 /* #undef HAVE_LIBCAP */
 
 /* Define to 1 if you have the <libscrypt.h> header file. */
-#define HAVE_LIBSCRYPT_H 1
+/* #undef HAVE_LIBSCRYPT_H */
 
 /* Define to 1 if you have the `libscrypt_scrypt' function. */
-#define HAVE_LIBSCRYPT_SCRYPT 1
+/* #undef HAVE_LIBSCRYPT_SCRYPT */
 
 /* Define to 1 if you have the <limits.h> header file. */
 #define HAVE_LIMITS_H 1
@@ -292,7 +292,7 @@
 /* #undef HAVE_LTTNG_TRACEPOINT_H */
 
 /* Have LZMA */
-#define HAVE_LZMA 1
+/* #undef HAVE_LZMA */
 
 /* Define to 1 if you have the <machine/limits.h> header file. */
 #define HAVE_MACHINE_LIMITS_H 1
@@ -917,3 +917,4 @@
 #  define WIN32_LEAN_AND_MEAN 1
 # endif
 #endif
+
