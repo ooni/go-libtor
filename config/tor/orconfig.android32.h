@@ -7,12 +7,16 @@
 /* All assert failures are fatal */
 /* #undef ALL_BUGS_ARE_FATAL */
 
-/* # for 0.4.6.7 Approximate date when this software was released. (Updated
-   when the version changes.) */
-#define APPROX_RELEASE_DATE "2021-08-16"
+/* # for {{.StrVer}} Approximate date when this software was released.
+   (Updated when the version changes.) */
+#define APPROX_RELEASE_DATE "2021-10-28"
 
 /* tor's build directory */
 #define BUILDDIR ""
+
+#define SHARE_DATADIR ""
+
+#define LOCALSTATEDIR ""
 
 /* Compiler name */
 #define COMPILER /**/
@@ -21,17 +25,13 @@
 #define COMPILER_VENDOR "clang"
 
 /* Compiler version */
-#define COMPILER_VERSION "12.0.0"
+#define COMPILER_VERSION "11.0.5"
 
 /* tor's configuration directory */
-#define CONFDIR ""
+#define CONFDIR "/usr/local/etc/tor"
 
 /* Flags passed to configure */
-#define CONFIG_FLAGS "--disable-asciidoc"
-
-#define SHARE_DATADIR ""
-
-#define LOCALSTATEDIR ""
+#define CONFIG_FLAGS "--host=arm-linux-androideabi --enable-android --enable-pic --enable-restart-debugging --disable-zstd --disable-lzma --disable-tool-name-check --enable-static-libevent --with-libevent-dir= --enable-static-openssl --with-openssl-dir= --disable-asciidoc"
 
 /* Enable smartlist debugging */
 /* #undef DEBUG_SMARTLIST */
@@ -55,7 +55,7 @@
 #define ENABLE_OPENSSL 1
 
 /* Defined if we're building with support for in-process restart debugging. */
-/* #undef ENABLE_RESTART_DEBUGGING */
+#define ENABLE_RESTART_DEBUGGING 1
 
 /* Defined if we're going to try to use zstd's "static-only" APIs. */
 #define ENABLE_ZSTD_ADVANCED_APIS 1
@@ -82,10 +82,10 @@
 #define HAVE_ATTR_FALLTHROUGH 1
 
 /* Define to 1 if you have the `backtrace' function. */
-#define HAVE_BACKTRACE 1
+/* #undef HAVE_BACKTRACE */
 
 /* Define to 1 if you have the `backtrace_symbols_fd' function. */
-#define HAVE_BACKTRACE_SYMBOLS_FD 1
+/* #undef HAVE_BACKTRACE_SYMBOLS_FD */
 
 /* Define to 1 if you have the `cap_set_proc' function. */
 /* #undef HAVE_CAP_SET_PROC */
@@ -103,7 +103,7 @@
 #define HAVE_CLOCK_GETTIME 1
 
 /* Define to 1 if you have the <crt_externs.h> header file. */
-#define HAVE_CRT_EXTERNS_H 1
+/* #undef HAVE_CRT_EXTERNS_H */
 
 /* Define to 1 if you have the <crypto_scalarmult_curve25519.h> header file.
    */
@@ -114,7 +114,7 @@
 
 /* Define to 1 if you have the declaration of `mlockall', and to 0 if you
    don't. */
-#define HAVE_DECL_MLOCKALL 1
+#define HAVE_DECL_MLOCKALL 0
 
 /* Define to 1 if you have the declaration of `SecureZeroMemory', and to 0 if
    you don't. */
@@ -131,10 +131,10 @@
 #define HAVE_ERR_LOAD_KDF_STRINGS 1
 
 /* Define to 1 if you have the `evdns_base_get_nameserver_addr' function. */
-#define HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR 1
+/* #undef HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR */
 
 /* Define to 1 if you have the <event2/bufferevent_ssl.h> header file. */
-#define HAVE_EVENT2_BUFFEREVENT_SSL_H 1
+/* #undef HAVE_EVENT2_BUFFEREVENT_SSL_H */
 
 /* Define to 1 if you have the <event2/dns.h> header file. */
 #define HAVE_EVENT2_DNS_H 1
@@ -143,26 +143,26 @@
 #define HAVE_EVENT2_EVENT_H 1
 
 /* Define to 1 if you have the `eventfd' function. */
-/* #undef HAVE_EVENTFD */
+#define HAVE_EVENTFD 1
 
 /* Define to 1 if you have the `EVP_PBE_scrypt' function. */
 #define HAVE_EVP_PBE_SCRYPT 1
 
 /* Define to 1 if you have the `evutil_secure_rng_add_bytes' function. */
-#define HAVE_EVUTIL_SECURE_RNG_ADD_BYTES 1
+/* #undef HAVE_EVUTIL_SECURE_RNG_ADD_BYTES */
 
 /* Define to 1 if you have the `evutil_secure_rng_set_urandom_device_file'
    function. */
-#define HAVE_EVUTIL_SECURE_RNG_SET_URANDOM_DEVICE_FILE 1
+/* #undef HAVE_EVUTIL_SECURE_RNG_SET_URANDOM_DEVICE_FILE */
 
 /* Define to 1 if you have the <execinfo.h> header file. */
-#define HAVE_EXECINFO_H 1
+/* #undef HAVE_EXECINFO_H */
 
 /* Define to 1 if you have the `explicit_bzero' function. */
 /* #undef HAVE_EXPLICIT_BZERO */
 
 /* Defined if we have extern char **environ already declared */
-/* #undef HAVE_EXTERN_ENVIRON_DECLARED */
+#define HAVE_EXTERN_ENVIRON_DECLARED 1
 
 /* Define to 1 if you have the <fcntl.h> header file. */
 #define HAVE_FCNTL_H 1
@@ -174,19 +174,19 @@
 #define HAVE_FSYNC 1
 
 /* Define to 1 if you have the `ftime' function. */
-#define HAVE_FTIME 1
+/* #undef HAVE_FTIME */
 
 /* Define to 1 if you have the `getaddrinfo' function. */
 #define HAVE_GETADDRINFO 1
 
 /* Define to 1 if you have the `getdelim' function. */
-#define HAVE_GETDELIM 1
+/* #undef HAVE_GETDELIM */
 
 /* Define to 1 if you have the `getentropy' function. */
-#define HAVE_GETENTROPY 1
+/* #undef HAVE_GETENTROPY */
 
 /* Define this if you have any gethostbyname_r() */
-/* #undef HAVE_GETHOSTBYNAME_R */
+#define HAVE_GETHOSTBYNAME_R 1
 
 /* Define this if gethostbyname_r takes 3 arguments */
 /* #undef HAVE_GETHOSTBYNAME_R_3_ARG */
@@ -195,19 +195,19 @@
 /* #undef HAVE_GETHOSTBYNAME_R_5_ARG */
 
 /* Define this if gethostbyname_r takes 6 arguments */
-/* #undef HAVE_GETHOSTBYNAME_R_6_ARG */
+#define HAVE_GETHOSTBYNAME_R_6_ARG 1
 
 /* Define to 1 if you have the `getifaddrs' function. */
-#define HAVE_GETIFADDRS 1
+/* #undef HAVE_GETIFADDRS */
 
 /* Define to 1 if you have the `getline' function. */
-#define HAVE_GETLINE 1
+/* #undef HAVE_GETLINE */
 
 /* Define to 1 if you have the `getresgid' function. */
-/* #undef HAVE_GETRESGID */
+#define HAVE_GETRESGID 1
 
 /* Define to 1 if you have the `getresuid' function. */
-/* #undef HAVE_GETRESUID */
+#define HAVE_GETRESUID 1
 
 /* Define to 1 if you have the `getrlimit' function. */
 #define HAVE_GETRLIMIT 1
@@ -219,7 +219,7 @@
 /* #undef HAVE_GET_CURRENT_DIR_NAME */
 
 /* Define to 1 if you have the `glob' function. */
-#define HAVE_GLOB 1
+/* #undef HAVE_GLOB */
 
 /* Define to 1 if you have the <glob.h> header file. */
 #define HAVE_GLOB_H 1
@@ -249,59 +249,59 @@
 #define HAVE_IOCTL 1
 
 /* Define to 1 if you have the `issetugid' function. */
-#define HAVE_ISSETUGID 1
+/* #undef HAVE_ISSETUGID */
 
 /* Defined if KIST scheduler is supported on this system */
-/* #undef HAVE_KIST_SUPPORT */
+#define HAVE_KIST_SUPPORT 1
 
 /* Define to 1 if you have the `cap' library (-lcap). */
 /* #undef HAVE_LIBCAP */
 
 /* Define to 1 if you have the <libscrypt.h> header file. */
-#define HAVE_LIBSCRYPT_H 1
+/* #undef HAVE_LIBSCRYPT_H */
 
 /* Define to 1 if you have the `libscrypt_scrypt' function. */
-#define HAVE_LIBSCRYPT_SCRYPT 1
+/* #undef HAVE_LIBSCRYPT_SCRYPT */
 
 /* Define to 1 if you have the <limits.h> header file. */
 #define HAVE_LIMITS_H 1
 
 /* Define to 1 if you have the <linux/if.h> header file. */
-/* #undef HAVE_LINUX_IF_H */
+#define HAVE_LINUX_IF_H 1
 
 /* Define to 1 if you have the <linux/netfilter_ipv4.h> header file. */
-/* #undef HAVE_LINUX_NETFILTER_IPV4_H */
+#define HAVE_LINUX_NETFILTER_IPV4_H 1
 
 /* Define to 1 if you have the <linux/netfilter_ipv6/ip6_tables.h> header
    file. */
-/* #undef HAVE_LINUX_NETFILTER_IPV6_IP6_TABLES_H */
+#define HAVE_LINUX_NETFILTER_IPV6_IP6_TABLES_H 1
 
 /* Define to 1 if you have the <linux/types.h> header file. */
-/* #undef HAVE_LINUX_TYPES_H */
+#define HAVE_LINUX_TYPES_H 1
 
 /* Define to 1 if you have the `llround' function. */
-#define HAVE_LLROUND 1
+/* #undef HAVE_LLROUND */
 
 /* Define to 1 if you have the `localtime_r' function. */
 #define HAVE_LOCALTIME_R 1
 
 /* Define to 1 if you have the `lround' function. */
-#define HAVE_LROUND 1
+/* #undef HAVE_LROUND */
 
 /* Define to 1 if you have the <lttng/tracepoint.h> header file. */
 /* #undef HAVE_LTTNG_TRACEPOINT_H */
 
 /* Have LZMA */
-#define HAVE_LZMA 1
+/* #undef HAVE_LZMA */
 
 /* Define to 1 if you have the <machine/limits.h> header file. */
-#define HAVE_MACHINE_LIMITS_H 1
+/* #undef HAVE_MACHINE_LIMITS_H */
 
 /* Define to 1 if you have the `mach_approximate_time' function. */
-#define HAVE_MACH_APPROXIMATE_TIME 1
+/* #undef HAVE_MACH_APPROXIMATE_TIME */
 
 /* Define to 1 if you have the <mach/vm_inherit.h> header file. */
-#define HAVE_MACH_VM_INHERIT_H 1
+/* #undef HAVE_MACH_VM_INHERIT_H */
 
 /* Defined if the compiler supports __FUNCTION__ */
 #define HAVE_MACRO__FUNCTION__ 1
@@ -316,22 +316,22 @@
 #define HAVE_MADVISE 1
 
 /* Define to 1 if you have the <malloc.h> header file. */
-/* #undef HAVE_MALLOC_H */
+#define HAVE_MALLOC_H 1
 
 /* Define to 1 if you have the `memmem' function. */
 #define HAVE_MEMMEM 1
 
 /* Define to 1 if you have the `memset_s' function. */
-#define HAVE_MEMSET_S 1
+/* #undef HAVE_MEMSET_S */
 
 /* Define to 1 if you have the `minherit' function. */
-#define HAVE_MINHERIT 1
+/* #undef HAVE_MINHERIT */
 
 /* Define to 1 if you have the <minix/config.h> header file. */
 /* #undef HAVE_MINIX_CONFIG_H */
 
 /* Define to 1 if you have the `mlockall' function. */
-#define HAVE_MLOCKALL 1
+/* #undef HAVE_MLOCKALL */
 
 /* Define to 1 if you have the `mmap' function. */
 #define HAVE_MMAP 1
@@ -353,7 +353,7 @@
 #define HAVE_NETDB_H 1
 
 /* Define to 1 if you have the <netinet/in6.h> header file. */
-/* #undef HAVE_NETINET_IN6_H */
+#define HAVE_NETINET_IN6_H 1
 
 /* Define to 1 if you have the <netinet/in.h> header file. */
 #define HAVE_NETINET_IN_H 1
@@ -368,10 +368,10 @@
 #define HAVE_PIPE 1
 
 /* Define to 1 if you have the `pipe2' function. */
-/* #undef HAVE_PIPE2 */
+#define HAVE_PIPE2 1
 
 /* Define to 1 if you have the `prctl' function. */
-/* #undef HAVE_PRCTL */
+#define HAVE_PRCTL 1
 
 /* Define to 1 if you have the `pthread_condattr_setclock' function. */
 /* #undef HAVE_PTHREAD_CONDATTR_SETCLOCK */
@@ -386,13 +386,13 @@
 #define HAVE_PWD_H 1
 
 /* Define to 1 if you have the `readpassphrase' function. */
-#define HAVE_READPASSPHRASE 1
+/* #undef HAVE_READPASSPHRASE */
 
 /* Define to 1 if you have the <readpassphrase.h> header file. */
-#define HAVE_READPASSPHRASE_H 1
+/* #undef HAVE_READPASSPHRASE_H */
 
 /* Define to 1 if you have the `rint' function. */
-#define HAVE_RINT 1
+/* #undef HAVE_RINT */
 
 /* Define to 1 if the system has the type `rlim_t'. */
 #define HAVE_RLIM_T 1
@@ -449,7 +449,7 @@
 /* #undef HAVE_SSL_STATE */
 
 /* Define to 1 if you have the `statvfs' function. */
-#define HAVE_STATVFS 1
+/* #undef HAVE_STATVFS */
 
 /* Define to 1 if you have the <stdatomic.h> header file. */
 #define HAVE_STDATOMIC_H 1
@@ -497,29 +497,29 @@
 #define HAVE_STRUCT_IN6_ADDR 1
 
 /* Define to 1 if `s6_addr16' is a member of `struct in6_addr'. */
-/* #undef HAVE_STRUCT_IN6_ADDR_S6_ADDR16 */
+#define HAVE_STRUCT_IN6_ADDR_S6_ADDR16 1
 
 /* Define to 1 if `s6_addr32' is a member of `struct in6_addr'. */
-/* #undef HAVE_STRUCT_IN6_ADDR_S6_ADDR32 */
+#define HAVE_STRUCT_IN6_ADDR_S6_ADDR32 1
 
 /* Define to 1 if the system has the type `struct sockaddr_in6'. */
 #define HAVE_STRUCT_SOCKADDR_IN6 1
 
 /* Define to 1 if `sin6_len' is a member of `struct sockaddr_in6'. */
-#define HAVE_STRUCT_SOCKADDR_IN6_SIN6_LEN 1
+/* #undef HAVE_STRUCT_SOCKADDR_IN6_SIN6_LEN */
 
 /* Define to 1 if `sin_len' is a member of `struct sockaddr_in'. */
-#define HAVE_STRUCT_SOCKADDR_IN_SIN_LEN 1
+/* #undef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN */
 
 /* Define to 1 if `get_cipher_by_char' is a member of `struct ssl_method_st'.
    */
 /* #undef HAVE_STRUCT_SSL_METHOD_ST_GET_CIPHER_BY_CHAR */
 
 /* Define to 1 if `tcpi_snd_mss' is a member of `struct tcp_info'. */
-/* #undef HAVE_STRUCT_TCP_INFO_TCPI_SND_MSS */
+#define HAVE_STRUCT_TCP_INFO_TCPI_SND_MSS 1
 
 /* Define to 1 if `tcpi_unacked' is a member of `struct tcp_info'. */
-/* #undef HAVE_STRUCT_TCP_INFO_TCPI_UNACKED */
+#define HAVE_STRUCT_TCP_INFO_TCPI_UNACKED 1
 
 /* Define to 1 if `tv_sec' is a member of `struct timeval'. */
 #define HAVE_STRUCT_TIMEVAL_TV_SEC 1
@@ -528,7 +528,7 @@
 #define HAVE_SYSCONF 1
 
 /* Define to 1 if you have the `sysctl' function. */
-#define HAVE_SYSCTL 1
+/* #undef HAVE_SYSCTL */
 
 /* Define to 1 if you have the <syslog.h> header file. */
 #define HAVE_SYSLOG_H 1
@@ -540,10 +540,10 @@
 /* #undef HAVE_SYSTEMD_209 */
 
 /* Define to 1 if you have the <sys/capability.h> header file. */
-/* #undef HAVE_SYS_CAPABILITY_H */
+#define HAVE_SYS_CAPABILITY_H 1
 
 /* Define to 1 if you have the <sys/eventfd.h> header file. */
-/* #undef HAVE_SYS_EVENTFD_H */
+#define HAVE_SYS_EVENTFD_H 1
 
 /* Define to 1 if you have the <sys/fcntl.h> header file. */
 #define HAVE_SYS_FCNTL_H 1
@@ -555,7 +555,7 @@
 #define HAVE_SYS_IOCTL_H 1
 
 /* Define to 1 if you have the <sys/limits.h> header file. */
-/* #undef HAVE_SYS_LIMITS_H */
+#define HAVE_SYS_LIMITS_H 1
 
 /* Define to 1 if you have the <sys/mman.h> header file. */
 #define HAVE_SYS_MMAN_H 1
@@ -564,7 +564,7 @@
 #define HAVE_SYS_PARAM_H 1
 
 /* Define to 1 if you have the <sys/prctl.h> header file. */
-/* #undef HAVE_SYS_PRCTL_H */
+#define HAVE_SYS_PRCTL_H 1
 
 /* Define to 1 if you have the <sys/random.h> header file. */
 #define HAVE_SYS_RANDOM_H 1
@@ -591,7 +591,7 @@
 #define HAVE_SYS_SYSCALL_H 1
 
 /* Define to 1 if you have the <sys/sysctl.h> header file. */
-#define HAVE_SYS_SYSCTL_H 1
+/* #undef HAVE_SYS_SYSCTL_H */
 
 /* Define to 1 if you have the <sys/time.h> header file. */
 #define HAVE_SYS_TIME_H 1
@@ -630,7 +630,7 @@
 #define HAVE_TRUNCATE 1
 
 /* Define to 1 if you have the <ucontext.h> header file. */
-/* #undef HAVE_UCONTEXT_H */
+#define HAVE_UCONTEXT_H 1
 
 /* Define to 1 if the system has the type `uint'. */
 #define HAVE_UINT 1
@@ -666,7 +666,7 @@
 /* #undef HAVE_ZSTD_ESTIMATEDCTXSIZE */
 
 /* Define to 1 if you have the `_NSGetEnviron' function. */
-#define HAVE__NSGETENVIRON 1
+/* #undef HAVE__NSGETENVIRON */
 
 /* Define to 1 if you have the `_vscprintf' function. */
 /* #undef HAVE__VSCPRINTF */
@@ -675,13 +675,13 @@
 #define LOGFACILITY LOG_DAEMON
 
 /* Define to 1 iff malloc(0) returns a pointer */
-#define MALLOC_ZERO_WORKS 1
+/* #undef MALLOC_ZERO_WORKS */
 
 /* Define to 1 iff memset(0) sets pointers to NULL */
 #define NULL_REP_IS_ZERO_BYTES 1
 
 /* disable openssl deprecated-function warnings */
-#define OPENSSL_SUPPRESS_DEPRECATED 1
+/* #undef OPENSSL_SUPPRESS_DEPRECATED */
 
 /* Name of package */
 #define PACKAGE "tor"
@@ -705,7 +705,7 @@
 #define PACKAGE_VERSION "{{.StrVer}}"
 
 /* How to access the PC from a struct ucontext */
-#define PC_FROM_UCONTEXT uc_mcontext->__ss.__rip
+#define PC_FROM_UCONTEXT uc_mcontext.arm_pc
 
 /* Define to 1 iff right-shifting a negative value performs sign-extension */
 #define RSHIFT_DOES_SIGN_EXTEND 1
@@ -720,7 +720,7 @@
 #define SIZEOF_INT 4
 
 /* The size of `long', as computed by sizeof. */
-#define SIZEOF_LONG 8
+#define SIZEOF_LONG 4
 
 /* The size of `long long', as computed by sizeof. */
 #define SIZEOF_LONG_LONG 8
@@ -735,19 +735,19 @@
 #define SIZEOF_SHORT 2
 
 /* The size of `size_t', as computed by sizeof. */
-#define SIZEOF_SIZE_T 8
+#define SIZEOF_SIZE_T 4
 
 /* The size of `socklen_t', as computed by sizeof. */
 #define SIZEOF_SOCKLEN_T 4
 
 /* The size of `time_t', as computed by sizeof. */
-#define SIZEOF_TIME_T 8
+#define SIZEOF_TIME_T 4
 
 /* The size of `unsigned int', as computed by sizeof. */
 #define SIZEOF_UNSIGNED_INT 4
 
 /* The size of `void *', as computed by sizeof. */
-#define SIZEOF_VOID_P 8
+#define SIZEOF_VOID_P 4
 
 /* The size of `__int64', as computed by sizeof. */
 #define SIZEOF___INT64 0
@@ -764,7 +764,7 @@
 #define STDC_HEADERS 1
 
 /* Compile with Android specific features enabled */
-/* #undef USE_ANDROID */
+#define USE_ANDROID 1
 
 /* Defined if we should use an internal curve25519_donna{,_c64} implementation
    */
@@ -871,7 +871,7 @@
 /* #undef USE_TRACING_INSTRUMENTATION_USDT */
 
 /* "Define to enable transparent proxy support" */
-/* #undef USE_TRANSPARENT */
+#define USE_TRANSPARENT 1
 
 /* Define to 1 iff we represent negative integers with two's complement */
 #define USING_TWOS_COMPLEMENT 1
@@ -892,7 +892,7 @@
 #endif
 
 /* Number of bits in a file offset, on hosts where this is settable. */
-/* #undef _FILE_OFFSET_BITS */
+#define _FILE_OFFSET_BITS 64
 
 /* Define for large files, on AIX-style hosts. */
 /* #undef _LARGE_FILES */
@@ -917,3 +917,4 @@
 #  define WIN32_LEAN_AND_MEAN 1
 # endif
 #endif
+
