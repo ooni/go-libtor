@@ -8,7 +8,7 @@ package libtor
 import (
 	"github.com/cretz/bine/process"
 
-	"berty.tech/go-libtor/libtor"
+	"github.com/ooni/go-libtor/libtor"
 )
 
 // ProviderVersion returns the Tor provider name and version exposed from the

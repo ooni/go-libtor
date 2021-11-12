@@ -1,4 +1,4 @@
-module berty.tech/go-libtor
+module github.com/ooni/go-libtor
 
 go 1.13
 
