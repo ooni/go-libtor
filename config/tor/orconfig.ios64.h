@@ -7,12 +7,16 @@
 /* All assert failures are fatal */
 /* #undef ALL_BUGS_ARE_FATAL */
 
-/* # for 0.4.6.7 Approximate date when this software was released. (Updated
-   when the version changes.) */
-#define APPROX_RELEASE_DATE "2021-08-16"
+/* # for {{.StrVer}} Approximate date when this software was released.
+   (Updated when the version changes.) */
+#define APPROX_RELEASE_DATE "2021-10-28"
 
 /* tor's build directory */
 #define BUILDDIR ""
+
+#define SHARE_DATADIR ""
+
+#define LOCALSTATEDIR ""
 
 /* Compiler name */
 #define COMPILER /**/
@@ -24,14 +28,10 @@
 #define COMPILER_VERSION "12.0.0"
 
 /* tor's configuration directory */
-#define CONFDIR ""
+#define CONFDIR "/usr/local/etc/tor"
 
 /* Flags passed to configure */
-#define CONFIG_FLAGS "--disable-asciidoc"
-
-#define SHARE_DATADIR ""
-
-#define LOCALSTATEDIR ""
+#define CONFIG_FLAGS "--host=arm-apple-darwin --enable-pic --enable-restart-debugging --disable-zstd --disable-lzma --disable-tool-name-check --enable-static-libevent --with-libevent-dir= --enable-static-openssl --with-openssl-dir= --disable-asciidoc"
 
 /* Enable smartlist debugging */
 /* #undef DEBUG_SMARTLIST */
@@ -55,7 +55,7 @@
 #define ENABLE_OPENSSL 1
 
 /* Defined if we're building with support for in-process restart debugging. */
-/* #undef ENABLE_RESTART_DEBUGGING */
+#define ENABLE_RESTART_DEBUGGING 1
 
 /* Defined if we're going to try to use zstd's "static-only" APIs. */
 #define ENABLE_ZSTD_ADVANCED_APIS 1
@@ -100,7 +100,7 @@
 /* #undef HAVE_CFLAG_WUNUSED_CONST_VARIABLE */
 
 /* Define to 1 if you have the `clock_gettime' function. */
-#define HAVE_CLOCK_GETTIME 1
+/* #undef HAVE_CLOCK_GETTIME */
 
 /* Define to 1 if you have the <crt_externs.h> header file. */
 #define HAVE_CRT_EXTERNS_H 1
@@ -131,10 +131,10 @@
 #define HAVE_ERR_LOAD_KDF_STRINGS 1
 
 /* Define to 1 if you have the `evdns_base_get_nameserver_addr' function. */
-#define HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR 1
+/* #undef HAVE_EVDNS_BASE_GET_NAMESERVER_ADDR */
 
 /* Define to 1 if you have the <event2/bufferevent_ssl.h> header file. */
-#define HAVE_EVENT2_BUFFEREVENT_SSL_H 1
+/* #undef HAVE_EVENT2_BUFFEREVENT_SSL_H */
 
 /* Define to 1 if you have the <event2/dns.h> header file. */
 #define HAVE_EVENT2_DNS_H 1
@@ -149,11 +149,11 @@
 #define HAVE_EVP_PBE_SCRYPT 1
 
 /* Define to 1 if you have the `evutil_secure_rng_add_bytes' function. */
-#define HAVE_EVUTIL_SECURE_RNG_ADD_BYTES 1
+/* #undef HAVE_EVUTIL_SECURE_RNG_ADD_BYTES */
 
 /* Define to 1 if you have the `evutil_secure_rng_set_urandom_device_file'
    function. */
-#define HAVE_EVUTIL_SECURE_RNG_SET_URANDOM_DEVICE_FILE 1
+/* #undef HAVE_EVUTIL_SECURE_RNG_SET_URANDOM_DEVICE_FILE */
 
 /* Define to 1 if you have the <execinfo.h> header file. */
 #define HAVE_EXECINFO_H 1
@@ -183,7 +183,7 @@
 #define HAVE_GETDELIM 1
 
 /* Define to 1 if you have the `getentropy' function. */
-#define HAVE_GETENTROPY 1
+/* #undef HAVE_GETENTROPY */
 
 /* Define this if you have any gethostbyname_r() */
 /* #undef HAVE_GETHOSTBYNAME_R */
@@ -258,10 +258,10 @@
 /* #undef HAVE_LIBCAP */
 
 /* Define to 1 if you have the <libscrypt.h> header file. */
-#define HAVE_LIBSCRYPT_H 1
+/* #undef HAVE_LIBSCRYPT_H */
 
 /* Define to 1 if you have the `libscrypt_scrypt' function. */
-#define HAVE_LIBSCRYPT_SCRYPT 1
+/* #undef HAVE_LIBSCRYPT_SCRYPT */
 
 /* Define to 1 if you have the <limits.h> header file. */
 #define HAVE_LIMITS_H 1
@@ -292,13 +292,13 @@
 /* #undef HAVE_LTTNG_TRACEPOINT_H */
 
 /* Have LZMA */
-#define HAVE_LZMA 1
+/* #undef HAVE_LZMA */
 
 /* Define to 1 if you have the <machine/limits.h> header file. */
 #define HAVE_MACHINE_LIMITS_H 1
 
 /* Define to 1 if you have the `mach_approximate_time' function. */
-#define HAVE_MACH_APPROXIMATE_TIME 1
+/* #undef HAVE_MACH_APPROXIMATE_TIME */
 
 /* Define to 1 if you have the <mach/vm_inherit.h> header file. */
 #define HAVE_MACH_VM_INHERIT_H 1
@@ -567,7 +567,7 @@
 /* #undef HAVE_SYS_PRCTL_H */
 
 /* Define to 1 if you have the <sys/random.h> header file. */
-#define HAVE_SYS_RANDOM_H 1
+/* #undef HAVE_SYS_RANDOM_H */
 
 /* Define to 1 if you have the <sys/resource.h> header file. */
 #define HAVE_SYS_RESOURCE_H 1
@@ -675,13 +675,13 @@
 #define LOGFACILITY LOG_DAEMON
 
 /* Define to 1 iff malloc(0) returns a pointer */
-#define MALLOC_ZERO_WORKS 1
+/* #undef MALLOC_ZERO_WORKS */
 
 /* Define to 1 iff memset(0) sets pointers to NULL */
 #define NULL_REP_IS_ZERO_BYTES 1
 
 /* disable openssl deprecated-function warnings */
-#define OPENSSL_SUPPRESS_DEPRECATED 1
+/* #undef OPENSSL_SUPPRESS_DEPRECATED */
 
 /* Name of package */
 #define PACKAGE "tor"
@@ -705,7 +705,7 @@
 #define PACKAGE_VERSION "{{.StrVer}}"
 
 /* How to access the PC from a struct ucontext */
-#define PC_FROM_UCONTEXT uc_mcontext->__ss.__rip
+/* #undef PC_FROM_UCONTEXT */
 
 /* Define to 1 iff right-shifting a negative value performs sign-extension */
 #define RSHIFT_DOES_SIGN_EXTEND 1
@@ -917,3 +917,4 @@
 #  define WIN32_LEAN_AND_MEAN 1
 # endif
 #endif
+
