@@ -7,7 +7,7 @@
 /* All assert failures are fatal */
 /* #undef ALL_BUGS_ARE_FATAL */
 
-/* # for 0.4.6.7 Approximate date when this software was released.
+/* # for 0.4.6.8-dev Approximate date when this software was released.
    (Updated when the version changes.) */
 #define APPROX_RELEASE_DATE "2021-10-28"
 
@@ -693,7 +693,7 @@
 #define PACKAGE_NAME "tor"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "tor 0.4.6.7"
+#define PACKAGE_STRING "tor 0.4.6.8-dev"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "tor"
@@ -702,7 +702,7 @@
 #define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "0.4.6.7"
+#define PACKAGE_VERSION "0.4.6.8-dev"
 
 /* How to access the PC from a struct ucontext */
 /* #undef PC_FROM_UCONTEXT */
@@ -877,7 +877,7 @@
 #define USING_TWOS_COMPLEMENT 1
 
 /* Version number of package */
-#define VERSION "0.4.6.7"
+#define VERSION "0.4.6.8-dev"
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

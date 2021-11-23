@@ -7,9 +7,9 @@ The `go-libtor` project is a self-contained, fully statically linked Tor library
 | Library  | Version | Commit |
 |:-:|:-:|:-:|
 | zlib | 1.2.11 | [`cacf7f1d4e3d44d871b605da3b647f07d718623f`](https://github.com/madler/zlib/commit/cacf7f1d4e3d44d871b605da3b647f07d718623f) |
-| libevent | 2.2.0-alpha-dev | [`3daebf308a01b4b2d3fb867be3d6631f7b5a2dbb`](https://github.com/libevent/libevent/commit/3daebf308a01b4b2d3fb867be3d6631f7b5a2dbb) |
-| openssl | 1.1.1-stable | [`0ad7578822b188447b1946e65a0ec4b5b07ead3f`](https://github.com/openssl/openssl/commit/0ad7578822b188447b1946e65a0ec4b5b07ead3f) |
-| tor | 0.4.6.7 | [`2fdeeaa64d79c156b4bf68eadff4aedd5500a515`](https://gitweb.torproject.org/tor.git/commit/?id=2fdeeaa64d79c156b4bf68eadff4aedd5500a515) |
+| libevent | 2.2.0-alpha-dev | [`0c217f4fe1af6efdb99321401da6f4048398065f`](https://github.com/libevent/libevent/commit/0c217f4fe1af6efdb99321401da6f4048398065f) |
+| openssl | 1.1.1-stable | [`79ef18759a4f89af0b1e015766a73fa289095673`](https://github.com/openssl/openssl/commit/79ef18759a4f89af0b1e015766a73fa289095673) |
+| tor | 0.4.6.8-dev | [`d06bcf7672d20b0d655a8de7c176630f870cf595`](https://gitweb.torproject.org/tor.git/commit/?id=d06bcf7672d20b0d655a8de7c176630f870cf595) |
 
 The library is currently supported on:
 
@@ -26,7 +26,7 @@ This library is compatible with Go modules. All you need is to import `berty.tec
 The goal of this library is to be a self-contained Tor package for Go. As such, it plays nice with the usual `go get` workflow. That said, building Tor and all its dependencies locally can take quite a while, so it's recommended to run `go get` in verbose mode.
 
 ```
-$ go get -u -v -x berty.tech/go-libtor
+$ go get -u -v -x github.com/ooni/go-libtor
 ```
 
 You'll also need the [`bine`](https://github.com/cretz/bine) bindings to interface with the library:
@@ -36,22 +36,6 @@ go get -u github.com/cretz/bine/tor
 ```
 
 However to ensure a build consistency across all users of your project we recommend using **go mod**.
-
-## BuildTags (Dynamicaly linked libs and Staticaly linked one)
-
-Tor is always built in but tor's deps are by default dynamicaly linked, that require the build host to have the libs and their headers installed (`libevent-dev`, `zlib1g-dev` and `libssl-dev`) and the running host only requires the object files installed.
-
-There are 3 build tags to change from a dynamic to a static one, you don't need to provide anything, their sources are wrapped in `go-libtor` :
-- `staticLibevent`
-- `staticZlib`
-- `staticOpenssl`
-
-So a full static build command would be :
-```sh
-go build -v -x -tags "staticOpenssl,staticZlib,staticLibevent" .
-```
-
-But be aware that the build process is way longer in static and the resulting binary is way bigger (you can mitigate that by stripping it, most of the stuff is just openssl debug symbols).
 
 ## Usage
 
@@ -71,7 +55,7 @@ import (
 	"time"
 
 	"github.com/cretz/bine/tor"
-	"berty.tech/go-libtor"
+	"github.com/ooni/go-libtor"
 )
 
 func main() {
@@ -144,7 +128,7 @@ import (
 	"time"
 
 	"github.com/cretz/bine/tor"
-	"berty.tech/go-libtor"
+	"github.com/ooni/go-libtor"
 )
 
 // Run starts up an embedded Tor process, starts a hidden onion service on a new
@@ -205,7 +189,7 @@ Archive:  demo.aar
 
 Explaining how to load an `.aar` into an Android project is beyond the scope of this article, but you can load the archive with Android Studio as a module and edit your Gradle build config to add it as a dependency. An overly crude app would just start the server and drop the onion URL into an Android label:
 
-![Android](https://raw.githubusercontent.com/berty/go-libtor/master/demo.jpg)
+![Android](https://raw.githubusercontent.com/ooni/go-libtor/master/demo.jpg)
 
 That's actually it! We've managed to get a Tor hidden service running from an Android phone and access it from another device through the Tor network, all through 40 lines of Go- and 3 lines of Java code.
 
@@ -213,12 +197,10 @@ That's actually it! We've managed to get a Tor hidden service running from an An
 
 This repository is a fork of [ipsn/go-libtor](https://github.com/ipsn/go-libtor) originaly maintained by Péter Szilágyi ([@karalabe](https://github.com/karalabe)), but authorship of all code contained inside belongs to the individual upstream projects.
 
-We ([berty](https://berty.tech/)) have forked it because [ipsn/go-libtor](https://github.com/ipsn/go-libtor) doesn't seems maintained anymore.
 
-We have added many new fonctionalities :
-- Uplift of the wrapping process to support a multi os / multi stage process.
-- Darwin (iOS and Macos) support.
-- Dynamicaly loaded libs.
+This repository also includes work done by ([berty](https://berty.tech/)) in order to support macOS and iOS builds.
+
+We are currently [waiting to hear](https://github.com/berty/go-libtor/issues/6) back from the [upstreams](https://github.com/ipsn/go-libtor/issues/33) so for the time being we have decided to fork it.
 
 ## License
 
