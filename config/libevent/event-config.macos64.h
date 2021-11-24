@@ -25,6 +25,9 @@
 /* Define to 1 if you have the `accept4' function. */
 /* #undef EVENT__HAVE_ACCEPT4 */
 
+/* Define to 1 if you have the <afunix.h> header file. */
+/* #undef EVENT__HAVE_AFUNIX_H */
+
 /* Define to 1 if you have the `arc4random' function. */
 #define EVENT__HAVE_ARC4RANDOM 1
 
@@ -47,14 +50,6 @@
 /* Define to 1 if you have the declaration of `KERN_ARND', and to 0 if you
    don't. */
 #define EVENT__HAVE_DECL_KERN_ARND 0
-
-/* Define to 1 if you have the declaration of `KERN_RANDOM', and to 0 if you
-   don't. */
-#define EVENT__HAVE_DECL_KERN_RANDOM 0
-
-/* Define to 1 if you have the declaration of `RANDOM_UUID', and to 0 if you
-   don't. */
-#define EVENT__HAVE_DECL_RANDOM_UUID 0
 
 /* Define if /dev/poll is available */
 /* #undef EVENT__HAVE_DEVPOLL */
@@ -119,6 +114,9 @@
 /* Define to 1 if you have the `getprotobynumber' function. */
 #define EVENT__HAVE_GETPROTOBYNUMBER 1
 
+/* Define to 1 if you have the `getrandom' function. */
+/* #undef EVENT__HAVE_GETRANDOM */
+
 /* Define to 1 if you have the `getservbyname' function. */
 #define EVENT__HAVE_GETSERVBYNAME 1
 
@@ -143,14 +141,26 @@
 /* Define to 1 if you have the `kqueue' function. */
 #define EVENT__HAVE_KQUEUE 1
 
+/* Define to 1 if you have the `ws2_32' library (-lws2_32). */
+/* #undef EVENT__HAVE_LIBWS2_32 */
+
 /* Define if the system has zlib */
 #define EVENT__HAVE_LIBZ 1
 
 /* Define to 1 if you have the `mach_absolute_time' function. */
 #define EVENT__HAVE_MACH_ABSOLUTE_TIME 1
 
+/* Define to 1 if you have the <mach/mach.h> header file. */
+#define EVENT__HAVE_MACH_MACH_H 1
+
 /* Define to 1 if you have the <mach/mach_time.h> header file. */
 #define EVENT__HAVE_MACH_MACH_TIME_H 1
+
+/* Define if the system has mbedtls */
+/* #undef EVENT__HAVE_MBEDTLS */
+
+/* Define to 1 if you have the <mbedtls/ssl.h> header file. */
+/* #undef EVENT__HAVE_MBEDTLS_SSL_H */
 
 /* Define to 1 if you have the <minix/config.h> header file. */
 /* #undef EVENT__HAVE_MINIX_CONFIG_H */
@@ -174,10 +184,10 @@
 #define EVENT__HAVE_NETINET_TCP_H 1
 
 /* Define if the system has openssl */
-/* #undef EVENT__HAVE_OPENSSL */
+#define EVENT__HAVE_OPENSSL 1
 
 /* Define to 1 if you have the <openssl/ssl.h> header file. */
-/* #undef EVENT__HAVE_OPENSSL_SSL_H */
+#define EVENT__HAVE_OPENSSL_SSL_H 1
 
 /* Define to 1 if you have the `pipe' function. */
 #define EVENT__HAVE_PIPE 1
@@ -202,6 +212,9 @@
 
 /* Define if we have pthreads on this system */
 #define EVENT__HAVE_PTHREADS 1
+
+/* Define to 1 if you have the `pthread_mutexattr_setprotocol' function. */
+#define EVENT__HAVE_PTHREAD_MUTEXATTR_SETPROTOCOL 1
 
 /* Define to 1 if you have the `putenv' function. */
 #define EVENT__HAVE_PUTENV 1
@@ -230,9 +243,6 @@
 /* Define to 1 if you have the `signal' function. */
 #define EVENT__HAVE_SIGNAL 1
 
-/* Define to 1 if you have the `splice' function. */
-/* #undef EVENT__HAVE_SPLICE */
-
 /* Define to 1 if you have the <stdarg.h> header file. */
 #define EVENT__HAVE_STDARG_H 1
 
@@ -259,6 +269,9 @@
 
 /* Define to 1 if you have the `strsep' function. */
 #define EVENT__HAVE_STRSEP 1
+
+/* Define to 1 if you have the `strsignal' function. */
+#define EVENT__HAVE_STRSIGNAL 1
 
 /* Define to 1 if you have the `strtok_r' function. */
 #define EVENT__HAVE_STRTOK_R 1
@@ -328,6 +341,9 @@
 
 /* Define to 1 if you have the <sys/queue.h> header file. */
 #define EVENT__HAVE_SYS_QUEUE_H 1
+
+/* Define to 1 if you have the <sys/random.h> header file. */
+#define EVENT__HAVE_SYS_RANDOM_H 1
 
 /* Define to 1 if you have the <sys/resource.h> header file. */
 #define EVENT__HAVE_SYS_RESOURCE_H 1
@@ -410,17 +426,23 @@
 /* Define to 1 if you have the `usleep' function. */
 #define EVENT__HAVE_USLEEP 1
 
-/* Define to 1 if you have the `vasprintf' function. */
-#define EVENT__HAVE_VASPRINTF 1
-
 /* Define to 1 if you have the <wchar.h> header file. */
 #define EVENT__HAVE_WCHAR_H 1
 
+/* Define if your system supports the wepoll module */
+/* #undef EVENT__HAVE_WEPOLL */
+
 /* Define if kqueue works correctly with pipes */
-/* #undef EVENT__HAVE_WORKING_KQUEUE */
+#define EVENT__HAVE_WORKING_KQUEUE 1
 
 /* Define to 1 if you have the <zlib.h> header file. */
 #define EVENT__HAVE_ZLIB_H 1
+
+/* Define to 1 if you have the `_gmtime64' function. */
+/* #undef EVENT__HAVE__GMTIME64 */
+
+/* Define to 1 if you have the `_gmtime64_s' function. */
+/* #undef EVENT__HAVE__GMTIME64_S */
 
 /* Define to 1 if compiler have __FUNCTION__ */
 #define EVENT__HAVE___FUNCTION__ 1
@@ -432,7 +454,7 @@
 #define EVENT__LT_OBJDIR ".libs/"
 
 /* Numeric representation of the version */
-#define EVENT__NUMERIC_VERSION 0x02010b00
+#define EVENT__NUMERIC_VERSION 0x02020001
 
 /* Name of package */
 #define EVENT__PACKAGE "libevent"
@@ -444,7 +466,7 @@
 #define EVENT__PACKAGE_NAME "libevent"
 
 /* Define to the full name and version of this package. */
-#define EVENT__PACKAGE_STRING "libevent 2.1.11-stable"
+#define EVENT__PACKAGE_STRING "libevent 2.2.0-alpha-dev"
 
 /* Define to the one symbol short name of this package. */
 #define EVENT__PACKAGE_TARNAME "libevent"
@@ -453,7 +475,7 @@
 #define EVENT__PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define EVENT__PACKAGE_VERSION "2.1.11-stable"
+#define EVENT__PACKAGE_VERSION "2.2.0-alpha-dev"
 
 /* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
@@ -490,10 +512,6 @@
    required in a freestanding environment). This macro is provided for
    backward compatibility; new code need not use it. */
 #define EVENT__STDC_HEADERS 1
-
-/* Define to 1 if you can safely include both <sys/time.h> and <time.h>. This
-   macro is obsolete. */
-#define EVENT__TIME_WITH_SYS_TIME 1
 
 /* Enable extensions on AIX 3, Interix.  */
 #ifndef _ALL_SOURCE
@@ -584,16 +602,13 @@
 
 
 /* Version number of package */
-#define EVENT__VERSION "2.1.11-stable"
+#define EVENT__VERSION "2.2.0-alpha-dev"
 
 /* Number of bits in a file offset, on hosts where this is settable. */
 /* #undef _FILE_OFFSET_BITS */
 
 /* Define for large files, on AIX-style hosts. */
 /* #undef _LARGE_FILES */
-
-/* Define to empty if `const' does not conform to ANSI C. */
-/* #undef const */
 
 /* Define to `__inline__' or `__inline' if that's what the C compiler
    calls it, or to nothing if 'inline' is not supported under any name.  */
