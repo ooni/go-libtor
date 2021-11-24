@@ -415,7 +415,7 @@
 #define EVENT__LT_OBJDIR ".libs/"
 
 /* Numeric representation of the version */
-#define EVENT__NUMERIC_VERSION {{.NumVer}}
+#define EVENT__NUMERIC_VERSION 0x02020001
 
 /* Name of package */
 #define EVENT__PACKAGE "libevent"
@@ -427,7 +427,7 @@
 #define EVENT__PACKAGE_NAME "libevent"
 
 /* Define to the full name and version of this package. */
-#define EVENT__PACKAGE_STRING "libevent {{.StrVer}}"
+#define EVENT__PACKAGE_STRING "libevent 2.2.0-alpha-dev"
 
 /* Define to the one symbol short name of this package. */
 #define EVENT__PACKAGE_TARNAME "libevent"
@@ -436,7 +436,7 @@
 #define EVENT__PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define EVENT__PACKAGE_VERSION "{{.StrVer}}"
+#define EVENT__PACKAGE_VERSION "2.2.0-alpha-dev"
 
 /* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
@@ -498,7 +498,7 @@
 
 
 /* Version number of package */
-#define EVENT__VERSION "{{.StrVer}}"
+#define EVENT__VERSION "2.2.0-alpha-dev"
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 #ifndef _DARWIN_USE_64_BIT_INODE
