@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -12,7 +12,7 @@
  *
  * This 'state' file is a typed key-value store that allows multiple
  * entries for the same key.  It follows the same metaformat as described
- * in confparse.c, and uses the same code to read and write itself.
+ * in confmgt.c, and uses the same code to read and write itself.
  *
  * The state file is most suitable for small values that don't change too
  * frequently.  For values that become very large, we typically use a separate
@@ -32,19 +32,23 @@
 #include "core/or/or.h"
 #include "core/or/circuitstats.h"
 #include "app/config/config.h"
-#include "app/config/confparse.h"
+#include "feature/relay/transport_config.h"
+#include "lib/confmgt/confmgt.h"
 #include "core/mainloop/mainloop.h"
+#include "core/mainloop/netstatus.h"
 #include "core/mainloop/connection.h"
-#include "feature/control/control.h"
+#include "feature/control/control_events.h"
 #include "feature/client/entrynodes.h"
 #include "feature/hibernate/hibernate.h"
-#include "feature/stats/rephist.h"
+#include "feature/stats/bwhist.h"
 #include "feature/relay/router.h"
 #include "feature/relay/routermode.h"
 #include "lib/sandbox/sandbox.h"
 #include "app/config/statefile.h"
+#include "app/main/subsysmgr.h"
 #include "lib/encoding/confline.h"
 #include "lib/net/resolve.h"
+#include "lib/version/torversion.h"
 
 #include "app/config/or_state_st.h"
 
@@ -54,30 +58,50 @@
 
 /** A list of state-file "abbreviations," for compatibility. */
 static config_abbrev_t state_abbrevs_[] = {
-  { "AccountingBytesReadInterval", "AccountingBytesReadInInterval", 0, 0 },
-  { "HelperNode", "EntryGuard", 0, 0 },
-  { "HelperNodeDownSince", "EntryGuardDownSince", 0, 0 },
-  { "HelperNodeUnlistedSince", "EntryGuardUnlistedSince", 0, 0 },
-  { "EntryNode", "EntryGuard", 0, 0 },
-  { "EntryNodeDownSince", "EntryGuardDownSince", 0, 0 },
-  { "EntryNodeUnlistedSince", "EntryGuardUnlistedSince", 0, 0 },
   { NULL, NULL, 0, 0},
+};
+
+/** A list of obsolete keys that we do not and should not preserve.
+ *
+ * We could just let these live in ExtraLines indefinitely, but they're
+ * never going to be used again, and every version that used them
+ * has been obsolete for a long time.
+ * */
+static const char *obsolete_state_keys[] = {
+  /* These were renamed in 0.1.1.11-alpha */
+  "AccountingBytesReadInterval",
+  "HelperNode",
+  "HelperNodeDownSince",
+  "HelperNodeUnlistedSince",
+  "EntryNode",
+  "HelperNodeDownSince",
+  "EntryNodeUnlistedSince",
+  /* These were replaced by "Guard" in 0.3.0.1-alpha. */
+  "EntryGuard",
+  "EntryGuardDownSince",
+  "EntryGuardUnlistedSince",
+  "EntryGuardAddedBy",
+  "EntryGuardPathBias",
+  "EntryGuardPathUseBias",
+  /* This was replaced by OPE-based revision numbers in 0.3.5.1-alpha,
+   * and was never actually used in a released version. */
+  "HidServRevCounter",
+
+  NULL,
 };
 
 /** dummy instance of or_state_t, used for type-checking its
  * members with CONF_CHECK_VAR_TYPE. */
 DUMMY_TYPECHECK_INSTANCE(or_state_t);
 
-/*XXXX these next two are duplicates or near-duplicates from config.c */
-#define VAR(name,conftype,member,initvalue)                             \
-  { name, CONFIG_TYPE_ ## conftype, offsetof(or_state_t, member),       \
-      initvalue CONF_TEST_MEMBERS(or_state_t, conftype, member) }
-/** As VAR, but the option name and member name are the same. */
-#define V(member,conftype,initvalue)                                    \
+#define VAR(varname,conftype,member,initvalue)                          \
+  CONFIG_VAR_ETYPE(or_state_t, varname, conftype, member, 0, initvalue)
+#define V(member,conftype,initvalue)            \
   VAR(#member, conftype, member, initvalue)
 
 /** Array of "state" variables saved to the ~/.tor/state file. */
-static config_var_t state_vars_[] = {
+// clang-format off
+static const config_var_t state_vars_[] = {
   /* Remember to document these in state-contents.txt ! */
 
   V(AccountingBytesReadInInterval,    MEMUNIT,  NULL),
@@ -89,33 +113,31 @@ static config_var_t state_vars_[] = {
   V(AccountingSoftLimitHitAt,         ISOTIME,  NULL),
   V(AccountingBytesAtSoftLimit,       MEMUNIT,  NULL),
 
-  VAR("EntryGuard",              LINELIST_S,  EntryGuards,             NULL),
-  VAR("EntryGuardDownSince",     LINELIST_S,  EntryGuards,             NULL),
-  VAR("EntryGuardUnlistedSince", LINELIST_S,  EntryGuards,             NULL),
-  VAR("EntryGuardAddedBy",       LINELIST_S,  EntryGuards,             NULL),
-  VAR("EntryGuardPathBias",      LINELIST_S,  EntryGuards,             NULL),
-  VAR("EntryGuardPathUseBias",   LINELIST_S,  EntryGuards,             NULL),
-  V(EntryGuards,                 LINELIST_V,  NULL),
-
   VAR("TransportProxy",               LINELIST_S, TransportProxies, NULL),
   V(TransportProxies,                 LINELIST_V, NULL),
 
-  V(HidServRevCounter,            LINELIST, NULL),
-
   V(BWHistoryReadEnds,                ISOTIME,  NULL),
-  V(BWHistoryReadInterval,            UINT,     "900"),
+  V(BWHistoryReadInterval,            POSINT,     "900"),
   V(BWHistoryReadValues,              CSV,      ""),
   V(BWHistoryReadMaxima,              CSV,      ""),
   V(BWHistoryWriteEnds,               ISOTIME,  NULL),
-  V(BWHistoryWriteInterval,           UINT,     "900"),
+  V(BWHistoryWriteInterval,           POSINT,     "900"),
   V(BWHistoryWriteValues,             CSV,      ""),
   V(BWHistoryWriteMaxima,             CSV,      ""),
+  V(BWHistoryIPv6ReadEnds,                ISOTIME,  NULL),
+  V(BWHistoryIPv6ReadInterval,            POSINT,     "900"),
+  V(BWHistoryIPv6ReadValues,              CSV,      ""),
+  V(BWHistoryIPv6ReadMaxima,              CSV,      ""),
+  V(BWHistoryIPv6WriteEnds,               ISOTIME,  NULL),
+  V(BWHistoryIPv6WriteInterval,           POSINT,     "900"),
+  V(BWHistoryIPv6WriteValues,             CSV,      ""),
+  V(BWHistoryIPv6WriteMaxima,             CSV,      ""),
   V(BWHistoryDirReadEnds,             ISOTIME,  NULL),
-  V(BWHistoryDirReadInterval,         UINT,     "900"),
+  V(BWHistoryDirReadInterval,         POSINT,     "900"),
   V(BWHistoryDirReadValues,           CSV,      ""),
   V(BWHistoryDirReadMaxima,           CSV,      ""),
   V(BWHistoryDirWriteEnds,            ISOTIME,  NULL),
-  V(BWHistoryDirWriteInterval,        UINT,     "900"),
+  V(BWHistoryDirWriteInterval,        POSINT,     "900"),
   V(BWHistoryDirWriteValues,          CSV,      ""),
   V(BWHistoryDirWriteMaxima,          CSV,      ""),
 
@@ -126,47 +148,69 @@ static config_var_t state_vars_[] = {
   V(LastRotatedOnionKey,              ISOTIME,  NULL),
   V(LastWritten,                      ISOTIME,  NULL),
 
-  V(TotalBuildTimes,                  UINT,     NULL),
-  V(CircuitBuildAbandonedCount,       UINT,     "0"),
+  V(TotalBuildTimes,                  POSINT,     NULL),
+  V(CircuitBuildAbandonedCount,       POSINT,     "0"),
   VAR("CircuitBuildTimeBin",          LINELIST_S, BuildtimeHistogram, NULL),
   VAR("BuildtimeHistogram",           LINELIST_V, BuildtimeHistogram, NULL),
 
   END_OF_CONFIG_VARS
 };
+// clang-format on
 
 #undef VAR
 #undef V
 
 static int or_state_validate(or_state_t *state, char **msg);
 
-static int or_state_validate_cb(void *old_options, void *options,
-                                void *default_options,
-                                int from_setconf, char **msg);
-
-static void or_state_free_cb(void *state);
+static int or_state_validate_cb(const void *old_options,
+                                void *options, char **msg);
 
 /** Magic value for or_state_t. */
 #define OR_STATE_MAGIC 0x57A73f57
 
 /** "Extra" variable in the state that receives lines we can't parse. This
  * lets us preserve options from versions of Tor newer than us. */
-static config_var_t state_extra_var = {
-  "__extra", CONFIG_TYPE_LINELIST, offsetof(or_state_t, ExtraLines), NULL
-  CONF_TEST_MEMBERS(or_state_t, LINELIST, ExtraLines)
+static struct_member_t state_extra_var = {
+  .name = "__extra",
+  .type = CONFIG_TYPE_LINELIST,
+  .offset = offsetof(or_state_t, ExtraLines),
 };
 
 /** Configuration format for or_state_t. */
 static const config_format_t state_format = {
-  sizeof(or_state_t),
-  OR_STATE_MAGIC,
-  offsetof(or_state_t, magic_),
-  state_abbrevs_,
-  NULL,
-  state_vars_,
-  or_state_validate_cb,
-  or_state_free_cb,
-  &state_extra_var,
+  .size = sizeof(or_state_t),
+  .magic = {
+   "or_state_t",
+   OR_STATE_MAGIC,
+   offsetof(or_state_t, magic_),
+  },
+  .abbrevs = state_abbrevs_,
+  .vars = state_vars_,
+  .legacy_validate_fn = or_state_validate_cb,
+  .extra = &state_extra_var,
+  .has_config_suite = true,
+  .config_suite_offset = offsetof(or_state_t, substates_),
 };
+
+/* A global configuration manager for state-file objects */
+static config_mgr_t *state_mgr = NULL;
+
+/** Return the configuration manager for state-file objects. */
+STATIC const config_mgr_t *
+get_state_mgr(void)
+{
+  if (PREDICT_UNLIKELY(state_mgr == NULL)) {
+    state_mgr = config_mgr_new(&state_format);
+    int rv = subsystems_register_state_formats(state_mgr);
+    tor_assert(rv == 0);
+    config_mgr_freeze(state_mgr);
+  }
+  return state_mgr;
+}
+
+#define CHECK_STATE_MAGIC(s) STMT_BEGIN                        \
+    config_check_toplevel_magic(get_state_mgr(), (s));         \
+  STMT_END
 
 /** Persistent serialized state. */
 static or_state_t *global_state = NULL;
@@ -249,25 +293,6 @@ validate_transports_in_state(or_state_t *state)
   return 0;
 }
 
-static int
-or_state_validate_cb(void *old_state, void *state, void *default_state,
-                     int from_setconf, char **msg)
-{
-  /* We don't use these; only options do. Still, we need to match that
-   * signature. */
-  (void) from_setconf;
-  (void) default_state;
-  (void) old_state;
-
-  return or_state_validate(state, msg);
-}
-
-static void
-or_state_free_cb(void *state)
-{
-  or_state_free_(state);
-}
-
 /** Return 0 if every setting in <b>state</b> is reasonable, and a
  * permissible transition from <b>old_state</b>.  Else warn and return -1.
  * Should have no side effects, except for normalizing the contents of
@@ -276,6 +301,23 @@ or_state_free_cb(void *state)
 static int
 or_state_validate(or_state_t *state, char **msg)
 {
+  return config_validate(get_state_mgr(), NULL, state, msg);
+}
+
+/**
+ * Legacy validation/normalization callback for or_state_t.  See
+ * legacy_validate_fn_t for more information.
+ */
+static int
+or_state_validate_cb(const void *old_state, void *state_, char **msg)
+{
+  /* There is not a meaningful concept of a state-to-state transition,
+   * since we do not reload the state after we start. */
+  (void) old_state;
+  CHECK_STATE_MAGIC(state_);
+
+  or_state_t *state = state_;
+
   if (entry_guards_parse_state(state, 0, msg)<0)
     return -1;
 
@@ -292,14 +334,17 @@ or_state_set(or_state_t *new_state)
   char *err = NULL;
   int ret = 0;
   tor_assert(new_state);
-  config_free(&state_format, global_state);
+  config_free(get_state_mgr(), global_state);
   global_state = new_state;
+  if (subsystems_set_state(get_state_mgr(), global_state) < 0) {
+    ret = -1;
+  }
   if (entry_guards_parse_state(global_state, 1, &err)<0) {
     log_warn(LD_GENERAL,"%s",err);
     tor_free(err);
     ret = -1;
   }
-  if (rep_hist_load_state(global_state, &err)<0) {
+  if (bwhist_load_state(global_state, &err)<0) {
     log_warn(LD_GENERAL,"Unparseable bandwidth history state: %s",err);
     tor_free(err);
     ret = -1;
@@ -308,6 +353,7 @@ or_state_set(or_state_t *new_state)
       get_circuit_build_times_mutable(),global_state) < 0) {
     ret = -1;
   }
+
   return ret;
 }
 
@@ -353,9 +399,8 @@ or_state_save_broken(char *fname)
 STATIC or_state_t *
 or_state_new(void)
 {
-  or_state_t *new_state = tor_malloc_zero(sizeof(or_state_t));
-  new_state->magic_ = OR_STATE_MAGIC;
-  config_init(&state_format, new_state);
+  or_state_t *new_state = config_new(get_state_mgr());
+  config_init(get_state_mgr(), new_state);
 
   return new_state;
 }
@@ -396,7 +441,7 @@ or_state_load(void)
     int assign_retval;
     if (config_get_lines(contents, &lines, 0)<0)
       goto done;
-    assign_retval = config_assign(&state_format, new_state,
+    assign_retval = config_assign(get_state_mgr(), new_state,
                                   lines, 0, &errmsg);
     config_free_lines(lines);
     if (assign_retval<0)
@@ -423,7 +468,7 @@ or_state_load(void)
     or_state_save_broken(fname);
 
     tor_free(contents);
-    config_free(&state_format, new_state);
+    config_free(get_state_mgr(), new_state);
 
     new_state = or_state_new();
   } else if (contents) {
@@ -442,6 +487,7 @@ or_state_load(void)
   } else {
     log_info(LD_GENERAL, "Initialized state");
   }
+  or_state_remove_obsolete_lines(&new_state->ExtraLines);
   if (or_state_set(new_state) == -1) {
     or_state_save_broken(fname);
   }
@@ -456,9 +502,39 @@ or_state_load(void)
   tor_free(fname);
   tor_free(contents);
   if (new_state)
-    config_free(&state_format, new_state);
+    config_free(get_state_mgr(), new_state);
 
   return r;
+}
+
+/** Remove from `extra_lines` every element whose key appears in
+ * `obsolete_state_keys`. */
+STATIC void
+or_state_remove_obsolete_lines(config_line_t **extra_lines)
+{
+  /* make a strmap for the obsolete state names, so we can have O(1)
+     lookup. */
+  strmap_t *bad_keys = strmap_new();
+  for (unsigned i = 0; obsolete_state_keys[i] != NULL; ++i) {
+    strmap_set_lc(bad_keys, obsolete_state_keys[i], (void*)"rmv");
+  }
+
+  config_line_t **line = extra_lines;
+  while (*line) {
+    if (strmap_get_lc(bad_keys, (*line)->key) != NULL) {
+      /* This key is obsolete; remove it. */
+      config_line_t *victim = *line;
+      *line = (*line)->next;
+
+      victim->next = NULL; // prevent double-free.
+      config_free_lines(victim);
+    } else {
+      /* This is just an unrecognized key; keep it. */
+      line = &(*line)->next;
+    }
+  }
+
+  strmap_free(bad_keys, NULL);
 }
 
 /** Did the last time we tried to write the state file fail? If so, we
@@ -496,9 +572,11 @@ or_state_save(time_t now)
 
   /* Call everything else that might dirty the state even more, in order
    * to avoid redundant writes. */
+  (void) subsystems_flush_state(get_state_mgr(), global_state);
   entry_guards_update_state(global_state);
-  rep_hist_update_state(global_state);
+  bwhist_update_state(global_state);
   circuit_build_times_update_state(get_circuit_build_times(), global_state);
+
   if (accounting_is_enabled(get_options()))
     accounting_run_housekeeping(now);
 
@@ -507,7 +585,7 @@ or_state_save(time_t now)
   tor_free(global_state->TorVersion);
   tor_asprintf(&global_state->TorVersion, "Tor %s", get_version());
 
-  state = config_dump(&state_format, NULL, global_state, 1, 0);
+  state = config_dump(get_state_mgr(), NULL, global_state, 1, 0);
   format_local_iso_time(tbuf, now);
   tor_asprintf(&contents,
                "# Tor state file last generated on %s local time\n"
@@ -617,7 +695,7 @@ get_stored_bindaddr_for_server_transport(const char *transport)
   {
     /* See if the user explicitly asked for a specific listening
        address for this transport. */
-    char *conf_bindaddr = get_transport_bindaddr_from_config(transport);
+    char *conf_bindaddr = pt_get_bindaddr_from_config(transport);
     if (conf_bindaddr)
       return conf_bindaddr;
   }
@@ -717,7 +795,7 @@ or_state_free_(or_state_t *state)
   if (!state)
     return;
 
-  config_free(&state_format, state);
+  config_free(get_state_mgr(), state);
 }
 
 void
@@ -725,4 +803,5 @@ or_state_free_all(void)
 {
   or_state_free(global_state);
   global_state = NULL;
+  config_mgr_free(state_mgr);
 }

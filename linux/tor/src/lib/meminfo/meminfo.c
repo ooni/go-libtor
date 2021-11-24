@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -17,6 +17,7 @@
 #include "lib/fs/files.h"
 #include "lib/log/log.h"
 #include "lib/malloc/malloc.h"
+#include "lib/string/util_string.h"
 
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
@@ -65,7 +66,7 @@ get_total_system_memory_impl(void)
   s = read_file_to_str_until_eof(fd, 65536, &file_size);
   if (!s)
     goto err;
-  cp = strstr(s, "MemTotal:");
+  cp = find_str_at_start_of_line(s, "MemTotal:");
   if (!cp)
     goto err;
   /* Use the system sscanf so that space will match a wider number of space */

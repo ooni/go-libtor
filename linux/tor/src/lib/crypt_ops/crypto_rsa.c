@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -59,7 +59,7 @@ crypto_get_rsa_padding(int padding)
     default: tor_assert(0); return -1; // LCOV_EXCL_LINE
     }
 }
-#endif
+#endif /* defined(ENABLE_OPENSSL) */
 
 /** Compare the public-key components of a and b.  Return non-zero iff
  * a==b.  A NULL key is considered to be distinct from all non-NULL

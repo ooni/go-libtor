@@ -1,6 +1,6 @@
 /* Copyright (c) 2003, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -49,7 +49,7 @@ typedef int32_t ssize_t;
  * aren't 2's complement, and you don't define LONG_MAX, then you're so
  * bizarre that I want nothing to do with you. */
 #ifndef USING_TWOS_COMPLEMENT
-#error "Seems that your platform doesn't use 2's complement arithmetic. Argh."
+#error "Your platform doesn't use 2's complement arithmetic."
 #endif
 
 #ifndef TIME_MAX
@@ -96,9 +96,9 @@ typedef int32_t ssize_t;
 #  else
 #    define TOR_PRIuSZ PRIu32
 #  endif
-#else
+#else /* !defined(_WIN32) */
 #  define TOR_PRIuSZ "zu"
-#endif
+#endif /* defined(_WIN32) */
 
 #ifdef _WIN32
 #  ifdef _WIN64
@@ -106,9 +106,9 @@ typedef int32_t ssize_t;
 #  else
 #    define TOR_PRIdSZ PRId32
 #  endif
-#else
+#else /* !defined(_WIN32) */
 #  define TOR_PRIdSZ "zd"
-#endif
+#endif /* defined(_WIN32) */
 
 #ifndef SSIZE_MAX
 #if (SIZEOF_SIZE_T == 4)
@@ -124,5 +124,13 @@ typedef int32_t ssize_t;
 #define SSIZE_T_CEILING ((ssize_t)(SSIZE_MAX-16))
 /** Any size_t larger than this amount is likely to be an underflow. */
 #define SIZE_T_CEILING  ((size_t)(SSIZE_MAX-16))
+
+#if SIZEOF_INT > SIZEOF_VOID_P
+#error "sizeof(int) > sizeof(void *) - Can't build Tor here."
+#endif
+
+#if SIZEOF_UNSIGNED_INT > SIZEOF_VOID_P
+#error "sizeof(unsigned int) > sizeof(void *) - Can't build Tor here."
+#endif
 
 #endif /* !defined(TOR_TORINT_H) */

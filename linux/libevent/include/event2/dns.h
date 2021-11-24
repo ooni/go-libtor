@@ -182,6 +182,7 @@ extern "C" {
 #define DNS_IPv4_A 1
 #define DNS_PTR 2
 #define DNS_IPv6_AAAA 3
+#define DNS_CNAME 4
 
 /** Disable searching for the query. */
 #define DNS_QUERY_NO_SEARCH 0x01
@@ -189,6 +190,8 @@ extern "C" {
 #define DNS_QUERY_USEVC 0x02
 /** Ignore trancation flag in responses (don't fallback to TCP connections). */
 #define DNS_QUERY_IGNTC 0x04
+/** Make a separate callback for CNAME in answer */
+#define DNS_CNAME_CALLBACK 0x80
 
 /* Allow searching */
 #define DNS_OPTION_SEARCH 1
@@ -266,13 +269,13 @@ struct event_base;
   evdns_config_windows_nameservers() on Windows.
 
   @param event_base the event base to associate the dns client with
-  @param initialize_nameservers any of EVDNS_BASE_INITIALIZE_NAMESERVERS|
+  @param flags any of EVDNS_BASE_INITIALIZE_NAMESERVERS|
     EVDNS_BASE_DISABLE_WHEN_INACTIVE|EVDNS_BASE_NAMESERVERS_NO_DEFAULT
   @return evdns_base object if successful, or NULL if an error occurred.
   @see evdns_base_free()
  */
 EVENT2_EXPORT_SYMBOL
-struct evdns_base * evdns_base_new(struct event_base *event_base, int initialize_nameservers);
+struct evdns_base * evdns_base_new(struct event_base *event_base, int flags);
 
 
 /**
@@ -601,31 +604,6 @@ typedef void (*evdns_debug_log_fn_type)(int is_warning, const char *msg);
  */
 EVENT2_EXPORT_SYMBOL
 void evdns_set_log_fn(evdns_debug_log_fn_type fn);
-
-/**
-   Set a callback that will be invoked to generate transaction IDs.  By
-   default, we pick transaction IDs based on the current clock time, which
-   is bad for security.
-
-   @param fn the new callback, or NULL to use the default.
-
-   NOTE: This function has no effect in Libevent 2.0.4-alpha and later,
-   since Libevent now provides its own secure RNG.
- */
-EVENT2_EXPORT_SYMBOL
-void evdns_set_transaction_id_fn(ev_uint16_t (*fn)(void));
-
-/**
-   Set a callback used to generate random bytes.  By default, we use
-   the same function as passed to evdns_set_transaction_id_fn to generate
-   bytes two at a time.  If a function is provided here, it's also used
-   to generate transaction IDs.
-
-   NOTE: This function has no effect in Libevent 2.0.4-alpha and later,
-   since Libevent now provides its own secure RNG.
-*/
-EVENT2_EXPORT_SYMBOL
-void evdns_set_random_bytes_fn(void (*fn)(char *, size_t));
 
 /*
  * Functions used to implement a DNS server.

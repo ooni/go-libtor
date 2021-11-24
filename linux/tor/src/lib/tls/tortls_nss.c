@@ -1,6 +1,6 @@
 /* Copyright (c) 2003, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -34,7 +34,7 @@
 #include "lib/tls/nss_countbytes.h"
 #include "lib/log/util_bug.h"
 
-DISABLE_GCC_WARNING(strict-prototypes)
+DISABLE_GCC_WARNING("-Wstrict-prototypes")
 #include <prio.h>
 // For access to rar sockets.
 #include <private/pprio.h>
@@ -42,7 +42,7 @@ DISABLE_GCC_WARNING(strict-prototypes)
 #include <sslt.h>
 #include <sslproto.h>
 #include <certt.h>
-ENABLE_GCC_WARNING(strict-prototypes)
+ENABLE_GCC_WARNING("-Wstrict-prototypes")
 
 static SECStatus always_accept_cert_cb(void *, PRFileDesc *, PRBool, PRBool);
 
@@ -369,6 +369,8 @@ tls_log_errors(tor_tls_t *tls, int severity, int domain,
 
   (void)tls;
   PRErrorCode code = PORT_GetError();
+  if (tls)
+    tls->last_error = code;
 
   const char *addr = tls ? tls->address : NULL;
   const char *string = PORT_ErrorToString(code);
@@ -390,6 +392,17 @@ tls_log_errors(tor_tls_t *tls, int severity, int domain,
     log_fn(severity, domain, "TLS error %s%s%s: %s", name, string,
            with, addr);
   }
+}
+const char *
+tor_tls_get_last_error_msg(const tor_tls_t *tls)
+{
+  IF_BUG_ONCE(!tls) {
+    return NULL;
+  }
+  if (tls->last_error == 0) {
+    return NULL;
+  }
+  return PORT_ErrorToString((PRErrorCode)tls->last_error);
 }
 
 tor_tls_t *
@@ -628,13 +641,6 @@ tor_tls_unblock_renegotiation(tor_tls_t *tls)
 
 void
 tor_tls_block_renegotiation(tor_tls_t *tls)
-{
-  tor_assert(tls);
-  /* We don't support renegotiation with NSS. */
-}
-
-void
-tor_tls_assert_renegotiation_unblocked(tor_tls_t *tls)
 {
   tor_assert(tls);
   /* We don't support renegotiation with NSS. */

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -49,9 +49,9 @@
 #include "core/or/protover.h"
 #include "feature/client/bridges.h"
 #include "feature/client/entrynodes.h"
-#include "feature/control/control.h"
+#include "feature/control/control_events.h"
 #include "feature/dirauth/process_descs.h"
-#include "feature/dircache/dirserv.h"
+#include "feature/dirclient/dirclient_modes.h"
 #include "feature/hs/hs_client.h"
 #include "feature/hs/hs_common.h"
 #include "feature/nodelist/describe.h"
@@ -59,11 +59,11 @@
 #include "feature/nodelist/microdesc.h"
 #include "feature/nodelist/networkstatus.h"
 #include "feature/nodelist/node_select.h"
+#include "feature/nodelist/nodefamily.h"
 #include "feature/nodelist/nodelist.h"
 #include "feature/nodelist/routerlist.h"
 #include "feature/nodelist/routerset.h"
 #include "feature/nodelist/torcert.h"
-#include "feature/rend/rendservice.h"
 #include "lib/encoding/binascii.h"
 #include "lib/err/backtrace.h"
 #include "lib/geoip/geoip.h"
@@ -126,7 +126,7 @@ typedef struct nodelist_t {
    *
    * Whenever a node's routerinfo or microdescriptor is about to change,
    * you should remove it from this map with node_remove_from_ed25519_map().
-   * Whenever a node's routerinfo or microdescriptor has just chaned,
+   * Whenever a node's routerinfo or microdescriptor has just changed,
    * you should add it to this map with node_add_to_ed25519_map().
    */
   HT_HEAD(nodelist_ed_map, node_t) nodes_by_ed_id;
@@ -156,9 +156,9 @@ node_id_eq(const node_t *node1, const node_t *node2)
   return tor_memeq(node1->identity, node2->identity, DIGEST_LEN);
 }
 
-HT_PROTOTYPE(nodelist_map, node_t, ht_ent, node_id_hash, node_id_eq)
+HT_PROTOTYPE(nodelist_map, node_t, ht_ent, node_id_hash, node_id_eq);
 HT_GENERATE2(nodelist_map, node_t, ht_ent, node_id_hash, node_id_eq,
-             0.6, tor_reallocarray_, tor_free_)
+             0.6, tor_reallocarray_, tor_free_);
 
 static inline unsigned int
 node_ed_id_hash(const node_t *node)
@@ -173,9 +173,9 @@ node_ed_id_eq(const node_t *node1, const node_t *node2)
 }
 
 HT_PROTOTYPE(nodelist_ed_map, node_t, ed_ht_ent, node_ed_id_hash,
-             node_ed_id_eq)
+             node_ed_id_eq);
 HT_GENERATE2(nodelist_ed_map, node_t, ed_ht_ent, node_ed_id_hash,
-             node_ed_id_eq, 0.6, tor_reallocarray_, tor_free_)
+             node_ed_id_eq, 0.6, tor_reallocarray_, tor_free_);
 
 /** The global nodelist. */
 static nodelist_t *the_nodelist=NULL;
@@ -450,8 +450,6 @@ node_addrs_changed(node_t *node)
 static void
 node_add_to_address_set(const node_t *node)
 {
-  tor_addr_t tmp_addr;
-
   if (!the_nodelist ||
       !the_nodelist->node_addrs || !the_nodelist->reentry_set)
     return;
@@ -464,19 +462,17 @@ node_add_to_address_set(const node_t *node)
    * test succeeds and thus the 0 value for the DirPort. */
 
   if (node->rs) {
-    if (node->rs->addr) {
-      tor_addr_from_ipv4h(&tmp_addr, node->rs->addr);
-      nodelist_add_addr_to_address_set(&tmp_addr, node->rs->or_port, 0);
-    }
+    if (!tor_addr_is_null(&node->rs->ipv4_addr))
+      nodelist_add_addr_to_address_set(&node->rs->ipv4_addr,
+                                       node->rs->ipv4_orport, 0);
     if (!tor_addr_is_null(&node->rs->ipv6_addr))
       nodelist_add_addr_to_address_set(&node->rs->ipv6_addr,
                                        node->rs->ipv6_orport, 0);
   }
   if (node->ri) {
-    if (node->ri->addr) {
-      tor_addr_from_ipv4h(&tmp_addr, node->ri->addr);
-      nodelist_add_addr_to_address_set(&tmp_addr, node->ri->or_port, 0);
-    }
+    if (!tor_addr_is_null(&node->ri->ipv4_addr))
+      nodelist_add_addr_to_address_set(&node->ri->ipv4_addr,
+                                       node->ri->ipv4_orport, 0);
     if (!tor_addr_is_null(&node->ri->ipv6_addr))
       nodelist_add_addr_to_address_set(&node->ri->ipv6_addr,
                                        node->ri->ipv6_orport, 0);
@@ -530,7 +526,7 @@ nodelist_add_addr_to_address_set(const tor_addr_t *addr,
                                  uint16_t or_port, uint16_t dir_port)
 {
   if (BUG(!addr) || tor_addr_is_null(addr) ||
-      (!tor_addr_is_v4(addr) && tor_addr_family(addr) != AF_INET6) ||
+      (!tor_addr_is_v4(addr) && !tor_addr_is_v6(addr)) ||
       !the_nodelist || !the_nodelist->node_addrs ||
       !the_nodelist->reentry_set) {
     return;
@@ -690,7 +686,7 @@ get_estimated_address_per_node, (void))
  * and grab microdescriptors into nodes as appropriate.
  */
 void
-nodelist_set_consensus(networkstatus_t *ns)
+nodelist_set_consensus(const networkstatus_t *ns)
 {
   const or_options_t *options = get_options();
   int authdir = authdir_mode_v3(options);
@@ -702,7 +698,8 @@ nodelist_set_consensus(networkstatus_t *ns)
   SMARTLIST_FOREACH(the_nodelist->nodes, node_t *, node,
                     node->rs = NULL);
 
-  /* Conservatively estimate that every node will have 2 addresses. */
+  /* Conservatively estimate that every node will have 2 addresses (v4 and
+   * v6). Then we add the number of configured trusted authorities we have. */
   int estimated_addresses = smartlist_len(ns->routerstatus_list) *
                             get_estimated_address_per_node();
   estimated_addresses += (get_n_authorities(V3_DIRINFO | BRIDGE_DIRINFO) *
@@ -747,7 +744,7 @@ nodelist_set_consensus(networkstatus_t *ns)
       node->is_bad_exit = rs->is_bad_exit;
       node->is_hs_dir = rs->is_hs_dir;
       node->ipv6_preferred = 0;
-      if (fascist_firewall_prefer_ipv6_orport(options) &&
+      if (reachable_addr_prefer_ipv6_orport(options) &&
           (tor_addr_is_null(&rs->ipv6_addr) == 0 ||
            (node->md && tor_addr_is_null(&node->md->ipv6_addr) == 0)))
         node->ipv6_preferred = 1;
@@ -1026,7 +1023,7 @@ nodelist_assert_ok(void)
 /** Ensure that the nodelist has been created with the most recent consensus.
  *  If that's not the case, make it so.  */
 void
-nodelist_ensure_freshness(networkstatus_t *ns)
+nodelist_ensure_freshness(const networkstatus_t *ns)
 {
   tor_assert(ns);
 
@@ -1042,10 +1039,11 @@ nodelist_ensure_freshness(networkstatus_t *ns)
     nodelist_set_consensus(ns);
   }
 }
+
 /** Return a list of a node_t * for every node we know about.  The caller
  * MUST NOT modify the list. (You can set and clear flags in the nodes if
  * you must, but you must not add or remove nodes.) */
-MOCK_IMPL(smartlist_t *,
+MOCK_IMPL(const smartlist_t *,
 nodelist_get_list,(void))
 {
   init_nodelist();
@@ -1148,8 +1146,8 @@ node_get_by_nickname,(const char *nickname, unsigned flags))
 
 /** Return the Ed25519 identity key for the provided node, or NULL if it
  * doesn't have one. */
-const ed25519_public_key_t *
-node_get_ed25519_id(const node_t *node)
+MOCK_IMPL(const ed25519_public_key_t *,
+node_get_ed25519_id,(const node_t *node))
 {
   const ed25519_public_key_t *ri_pk = NULL;
   const ed25519_public_key_t *md_pk = NULL;
@@ -1207,7 +1205,7 @@ node_ed25519_id_matches(const node_t *node, const ed25519_public_key_t *id)
 /** Dummy object that should be unreturnable.  Used to ensure that
  * node_get_protover_summary_flags() always returns non-NULL. */
 static const protover_summary_flags_t zero_protover_flags = {
-  0,0,0,0,0,0,0
+  0,0,0,0,0,0,0,0,0,0,0,0
 };
 
 /** Return the protover_summary_flags for a given node. */
@@ -1232,9 +1230,9 @@ node_get_protover_summary_flags(const node_t *node)
  * by ed25519 ID during the link handshake.  If <b>compatible_with_us</b>,
  * it needs to be using a link authentication method that we understand.
  * If not, any plausible link authentication method will do. */
-int
-node_supports_ed25519_link_authentication(const node_t *node,
-                                          int compatible_with_us)
+MOCK_IMPL(bool,
+node_supports_ed25519_link_authentication,(const node_t *node,
+                                           bool compatible_with_us))
 {
   if (! node_get_ed25519_id(node))
     return 0;
@@ -1249,7 +1247,7 @@ node_supports_ed25519_link_authentication(const node_t *node,
 
 /** Return true iff <b>node</b> supports the hidden service directory version
  * 3 protocol (proposal 224). */
-int
+bool
 node_supports_v3_hsdir(const node_t *node)
 {
   tor_assert(node);
@@ -1259,7 +1257,7 @@ node_supports_v3_hsdir(const node_t *node)
 
 /** Return true iff <b>node</b> supports ed25519 authentication as an hidden
  * service introduction point.*/
-int
+bool
 node_supports_ed25519_hs_intro(const node_t *node)
 {
   tor_assert(node);
@@ -1267,9 +1265,9 @@ node_supports_ed25519_hs_intro(const node_t *node)
   return node_get_protover_summary_flags(node)->supports_ed25519_hs_intro;
 }
 
-/** Return true iff <b>node</b> supports to be a rendezvous point for hidden
+/** Return true iff <b>node</b> can be a rendezvous point for hidden
  * service version 3 (HSRend=2). */
-int
+bool
 node_supports_v3_rendezvous_point(const node_t *node)
 {
   tor_assert(node);
@@ -1282,12 +1280,169 @@ node_supports_v3_rendezvous_point(const node_t *node)
   return node_get_protover_summary_flags(node)->supports_v3_rendezvous_point;
 }
 
+/** Return true iff <b>node</b> supports the DoS ESTABLISH_INTRO cell
+ * extension. */
+bool
+node_supports_establish_intro_dos_extension(const node_t *node)
+{
+  tor_assert(node);
+
+  return node_get_protover_summary_flags(node)->
+                           supports_establish_intro_dos_extension;
+}
+
+/** Return true iff <b>node</b> can initiate IPv6 extends (Relay=3).
+ *
+ * This check should only be performed by client path selection code.
+ *
+ * Extending relays should check their own IPv6 support using
+ * router_can_extend_over_ipv6(). Like other extends, they should not verify
+ * the link specifiers in the extend cell against the consensus, because it
+ * may be out of date. */
+bool
+node_supports_initiating_ipv6_extends(const node_t *node)
+{
+  tor_assert(node);
+
+  /* Relays can't initiate an IPv6 extend, unless they have an IPv6 ORPort. */
+  if (!node_has_ipv6_orport(node)) {
+    return 0;
+  }
+
+  /* Initiating relays also need to support the relevant protocol version. */
+  return
+    node_get_protover_summary_flags(node)->supports_initiating_ipv6_extends;
+}
+
+/** Return true iff <b>node</b> can accept IPv6 extends (Relay=2 or Relay=3)
+ * from other relays. If <b>need_canonical_ipv6_conn</b> is true, also check
+ * if the relay supports canonical IPv6 connections (Relay=3 only).
+ *
+ * This check should only be performed by client path selection code.
+ */
+bool
+node_supports_accepting_ipv6_extends(const node_t *node,
+                                            bool need_canonical_ipv6_conn)
+{
+  tor_assert(node);
+
+  /* Relays can't accept an IPv6 extend, unless they have an IPv6 ORPort. */
+  if (!node_has_ipv6_orport(node)) {
+    return 0;
+  }
+
+  /* Accepting relays also need to support the relevant protocol version. */
+  if (need_canonical_ipv6_conn) {
+    return
+      node_get_protover_summary_flags(node)->supports_canonical_ipv6_conns;
+  } else {
+    return
+      node_get_protover_summary_flags(node)->supports_accepting_ipv6_extends;
+  }
+}
+
 /** Return the RSA ID key's SHA1 digest for the provided node. */
 const uint8_t *
 node_get_rsa_id_digest(const node_t *node)
 {
   tor_assert(node);
   return (const uint8_t*)node->identity;
+}
+
+/* Returns a new smartlist with all possible link specifiers from node:
+ *  - legacy ID is mandatory thus MUST be present in node;
+ *  - include ed25519 link specifier if present in the node, and the node
+ *    supports ed25519 link authentication, and:
+ *    - if direct_conn is true, its link versions are compatible with us,
+ *    - if direct_conn is false, regardless of its link versions;
+ *  - include IPv4 link specifier, if the primary address is not IPv4, log a
+ *    BUG() warning, and return an empty smartlist;
+ *  - include IPv6 link specifier if present in the node.
+ *
+ * If node is NULL, returns an empty smartlist.
+ *
+ * The smartlist must be freed using link_specifier_smartlist_free(). */
+MOCK_IMPL(smartlist_t *,
+node_get_link_specifier_smartlist,(const node_t *node, bool direct_conn))
+{
+  link_specifier_t *ls;
+  tor_addr_port_t ap;
+  smartlist_t *lspecs = smartlist_new();
+
+  if (!node)
+    return lspecs;
+
+  /* Get the relay's IPv4 address. */
+  node_get_prim_orport(node, &ap);
+
+  /* We expect the node's primary address to be a valid IPv4 address.
+   * This conforms to the protocol, which requires either an IPv4 or IPv6
+   * address (or both). */
+  if (BUG(!tor_addr_is_v4(&ap.addr)) ||
+      BUG(!tor_addr_port_is_valid_ap(&ap, 0))) {
+    return lspecs;
+  }
+
+  ls = link_specifier_new();
+  link_specifier_set_ls_type(ls, LS_IPV4);
+  link_specifier_set_un_ipv4_addr(ls, tor_addr_to_ipv4h(&ap.addr));
+  link_specifier_set_un_ipv4_port(ls, ap.port);
+  /* Four bytes IPv4 and two bytes port. */
+  link_specifier_set_ls_len(ls, sizeof(ap.addr.addr.in_addr) +
+                            sizeof(ap.port));
+  smartlist_add(lspecs, ls);
+
+  /* Legacy ID is mandatory and will always be present in node. */
+  ls = link_specifier_new();
+  link_specifier_set_ls_type(ls, LS_LEGACY_ID);
+  memcpy(link_specifier_getarray_un_legacy_id(ls), node->identity,
+         link_specifier_getlen_un_legacy_id(ls));
+  link_specifier_set_ls_len(ls, link_specifier_getlen_un_legacy_id(ls));
+  smartlist_add(lspecs, ls);
+
+  /* ed25519 ID is only included if the node has it, and the node declares a
+   protocol version that supports ed25519 link authentication.
+   If direct_conn is true, we also require that the node's link version is
+   compatible with us. (Otherwise, we will be sending the ed25519 key
+   to another tor, which may support different link versions.) */
+  if (!ed25519_public_key_is_zero(&node->ed25519_id) &&
+      node_supports_ed25519_link_authentication(node, direct_conn)) {
+    ls = link_specifier_new();
+    link_specifier_set_ls_type(ls, LS_ED25519_ID);
+    memcpy(link_specifier_getarray_un_ed25519_id(ls), &node->ed25519_id,
+           link_specifier_getlen_un_ed25519_id(ls));
+    link_specifier_set_ls_len(ls, link_specifier_getlen_un_ed25519_id(ls));
+    smartlist_add(lspecs, ls);
+  }
+
+  /* Check for IPv6. If so, include it as well. */
+  if (node_has_ipv6_orport(node)) {
+    ls = link_specifier_new();
+    node_get_pref_ipv6_orport(node, &ap);
+    link_specifier_set_ls_type(ls, LS_IPV6);
+    size_t addr_len = link_specifier_getlen_un_ipv6_addr(ls);
+    const uint8_t *in6_addr = tor_addr_to_in6_addr8(&ap.addr);
+    uint8_t *ipv6_array = link_specifier_getarray_un_ipv6_addr(ls);
+    memcpy(ipv6_array, in6_addr, addr_len);
+    link_specifier_set_un_ipv6_port(ls, ap.port);
+    /* Sixteen bytes IPv6 and two bytes port. */
+    link_specifier_set_ls_len(ls, addr_len + sizeof(ap.port));
+    smartlist_add(lspecs, ls);
+  }
+
+  return lspecs;
+}
+
+/* Free a link specifier list. */
+void
+link_specifier_smartlist_free_(smartlist_t *ls_list)
+{
+  if (!ls_list)
+    return;
+
+  SMARTLIST_FOREACH(ls_list, link_specifier_t *, lspec,
+                    link_specifier_free(lspec));
+  smartlist_free(ls_list);
 }
 
 /** Return the nickname of <b>node</b>, or NULL if we can't find one. */
@@ -1429,8 +1584,7 @@ node_exit_policy_rejects_all(const node_t *node)
   if (node->ri)
     return node->ri->policy_is_reject_star;
   else if (node->md)
-    return node->md->exit_policy == NULL ||
-      short_policy_is_reject_star(node->md->exit_policy);
+    return node->md->policy_is_reject_star;
   else
     return 1;
 }
@@ -1459,32 +1613,14 @@ node_exit_policy_is_exact(const node_t *node, sa_family_t family)
  * "addr" is an IPv4 host-order address and port_field is a uint16_t.
  * r is typically a routerinfo_t or routerstatus_t.
  */
-#define SL_ADD_NEW_IPV4_AP(r, port_field, sl, valid) \
-  STMT_BEGIN \
-    if (tor_addr_port_is_valid_ipv4h((r)->addr, (r)->port_field, 0)) { \
-      valid = 1; \
-      tor_addr_port_t *ap = tor_malloc(sizeof(tor_addr_port_t)); \
-      tor_addr_from_ipv4h(&ap->addr, (r)->addr); \
-      ap->port = (r)->port_field; \
-      smartlist_add((sl), ap); \
-    } \
-  STMT_END
-
-/* Check if the "addr" and port_field fields from r are a valid non-listening
- * address/port. If so, set valid to true and add a newly allocated
- * tor_addr_port_t containing "addr" and port_field to sl.
- * "addr" is a tor_addr_t and port_field is a uint16_t.
- * r is typically a routerinfo_t or routerstatus_t.
- */
-#define SL_ADD_NEW_IPV6_AP(r, port_field, sl, valid) \
-  STMT_BEGIN \
-    if (tor_addr_port_is_valid(&(r)->ipv6_addr, (r)->port_field, 0)) { \
-      valid = 1; \
-      tor_addr_port_t *ap = tor_malloc(sizeof(tor_addr_port_t)); \
-      tor_addr_copy(&ap->addr, &(r)->ipv6_addr); \
-      ap->port = (r)->port_field; \
-      smartlist_add((sl), ap); \
-    } \
+#define SL_ADD_NEW_AP(r, addr_field, port_field, sl, valid)             \
+  STMT_BEGIN                                                            \
+    if (tor_addr_port_is_valid(&(r)->addr_field, (r)->port_field, 0)) { \
+      valid = 1;                                                        \
+      tor_addr_port_t *ap = tor_addr_port_new(&(r)->addr_field,         \
+                                              (r)->port_field);         \
+      smartlist_add((sl), ap);                                          \
+    }                                                                   \
   STMT_END
 
 /** Return list of tor_addr_port_t with all OR ports (in the sense IP
@@ -1503,33 +1639,32 @@ node_get_all_orports(const node_t *node)
 
   /* Find a valid IPv4 address and port */
   if (node->ri != NULL) {
-    SL_ADD_NEW_IPV4_AP(node->ri, or_port, sl, valid);
+    SL_ADD_NEW_AP(node->ri, ipv4_addr, ipv4_orport, sl, valid);
   }
 
   /* If we didn't find a valid address/port in the ri, try the rs */
   if (!valid && node->rs != NULL) {
-    SL_ADD_NEW_IPV4_AP(node->rs, or_port, sl, valid);
+    SL_ADD_NEW_AP(node->rs, ipv4_addr, ipv4_orport, sl, valid);
   }
 
   /* Find a valid IPv6 address and port */
   valid = 0;
   if (node->ri != NULL) {
-    SL_ADD_NEW_IPV6_AP(node->ri, ipv6_orport, sl, valid);
+    SL_ADD_NEW_AP(node->ri, ipv6_addr, ipv6_orport, sl, valid);
   }
 
   if (!valid && node->rs != NULL) {
-    SL_ADD_NEW_IPV6_AP(node->rs, ipv6_orport, sl, valid);
+    SL_ADD_NEW_AP(node->rs, ipv6_addr, ipv6_orport, sl, valid);
   }
 
   if (!valid && node->md != NULL) {
-    SL_ADD_NEW_IPV6_AP(node->md, ipv6_orport, sl, valid);
+    SL_ADD_NEW_AP(node->md, ipv6_addr, ipv6_orport, sl, valid);
   }
 
   return sl;
 }
 
-#undef SL_ADD_NEW_IPV4_AP
-#undef SL_ADD_NEW_IPV6_AP
+#undef SL_ADD_NEW_AP
 
 /** Wrapper around node_get_prim_orport for backward
     compatibility.  */
@@ -1541,21 +1676,20 @@ node_get_addr(const node_t *node, tor_addr_t *addr_out)
   tor_addr_copy(addr_out, &ap.addr);
 }
 
-/** Return the host-order IPv4 address for <b>node</b>, or 0 if it doesn't
- * seem to have one.  */
-uint32_t
-node_get_prim_addr_ipv4h(const node_t *node)
+/** Return the IPv4 address for <b>node</b>, or NULL if none found. */
+static const tor_addr_t *
+node_get_prim_addr_ipv4(const node_t *node)
 {
   /* Don't check the ORPort or DirPort, as this function isn't port-specific,
    * and the node might have a valid IPv4 address, yet have a zero
    * ORPort or DirPort.
    */
-  if (node->ri && tor_addr_is_valid_ipv4h(node->ri->addr, 0)) {
-    return node->ri->addr;
-  } else if (node->rs && tor_addr_is_valid_ipv4h(node->rs->addr, 0)) {
-    return node->rs->addr;
+  if (node->ri && tor_addr_is_valid(&node->ri->ipv4_addr, 0)) {
+    return &node->ri->ipv4_addr;
+  } else if (node->rs && tor_addr_is_valid(&node->rs->ipv4_addr, 0)) {
+    return &node->rs->ipv4_addr;
   }
-  return 0;
+  return NULL;
 }
 
 /** Copy a string representation of an IP address for <b>node</b> into
@@ -1563,12 +1697,10 @@ node_get_prim_addr_ipv4h(const node_t *node)
 void
 node_get_address_string(const node_t *node, char *buf, size_t len)
 {
-  uint32_t ipv4_addr = node_get_prim_addr_ipv4h(node);
+  const tor_addr_t *ipv4_addr = node_get_prim_addr_ipv4(node);
 
-  if (tor_addr_is_valid_ipv4h(ipv4_addr, 0)) {
-    tor_addr_t addr;
-    tor_addr_from_ipv4h(&addr, ipv4_addr);
-    tor_addr_to_str(buf, &addr, len, 0);
+  if (ipv4_addr) {
+    tor_addr_to_str(buf, ipv4_addr, len, 0);
   } else if (len > 0) {
     buf[0] = '\0';
   }
@@ -1603,19 +1735,6 @@ int
 node_is_me(const node_t *node)
 {
   return router_digest_is_me(node->identity);
-}
-
-/** Return <b>node</b> declared family (as a list of names), or NULL if
- * the node didn't declare a family. */
-const smartlist_t *
-node_get_declared_family(const node_t *node)
-{
-  if (node->ri && node->ri->declared_family)
-    return node->ri->declared_family;
-  else if (node->md && node->md->family)
-    return node->md->family;
-  else
-    return NULL;
 }
 
 /* Does this node have a valid IPv6 address?
@@ -1666,7 +1785,7 @@ node_has_ipv6_dirport(const node_t *node)
  *  ii) the router has no IPv4 OR address.
  *
  * If you don't have a node, consider looking it up.
- * If there is no node, use fascist_firewall_prefer_ipv6_orport().
+ * If there is no node, use reachable_addr_prefer_ipv6_orport().
  */
 int
 node_ipv6_or_preferred(const node_t *node)
@@ -1676,10 +1795,10 @@ node_ipv6_or_preferred(const node_t *node)
   node_assert_ok(node);
 
   /* XX/teor - node->ipv6_preferred is set from
-   * fascist_firewall_prefer_ipv6_orport() each time the consensus is loaded.
+   * reachable_addr_prefer_ipv6_orport() each time the consensus is loaded.
    */
   node_get_prim_orport(node, &ipv4_addr);
-  if (!fascist_firewall_use_ipv6(options)) {
+  if (!reachable_addr_use_ipv6(options)) {
     return 0;
   } else if (node->ipv6_preferred ||
              !tor_addr_port_is_valid_ap(&ipv4_addr, 0)) {
@@ -1688,12 +1807,12 @@ node_ipv6_or_preferred(const node_t *node)
   return 0;
 }
 
-#define RETURN_IPV4_AP(r, port_field, ap_out) \
-  STMT_BEGIN \
-    if (r && tor_addr_port_is_valid_ipv4h((r)->addr, (r)->port_field, 0)) { \
-      tor_addr_from_ipv4h(&(ap_out)->addr, (r)->addr); \
-      (ap_out)->port = (r)->port_field; \
-    } \
+#define RETURN_IPV4_AP(r, port_field, ap_out)                               \
+  STMT_BEGIN                                                                \
+    if (r && tor_addr_port_is_valid(&(r)->ipv4_addr, (r)->port_field, 0)) { \
+      tor_addr_copy(&(ap_out)->addr, &(r)->ipv4_addr);                      \
+      (ap_out)->port = (r)->port_field;                                     \
+    }                                                                       \
   STMT_END
 
 /** Copy the primary (IPv4) OR port (IP address and TCP port) for <b>node</b>
@@ -1712,8 +1831,8 @@ node_get_prim_orport(const node_t *node, tor_addr_port_t *ap_out)
   /* Check ri first, because rewrite_node_address_for_bridge() updates
    * node->ri with the configured bridge address. */
 
-  RETURN_IPV4_AP(node->ri, or_port, ap_out);
-  RETURN_IPV4_AP(node->rs, or_port, ap_out);
+  RETURN_IPV4_AP(node->ri, ipv4_orport, ap_out);
+  RETURN_IPV4_AP(node->rs, ipv4_orport, ap_out);
   /* Microdescriptors only have an IPv6 address */
 }
 
@@ -1774,7 +1893,7 @@ node_get_pref_ipv6_orport(const node_t *node, tor_addr_port_t *ap_out)
  *  or
  *  ii) our preference is for IPv6 Dir addresses.
  *
- * If there is no node, use fascist_firewall_prefer_ipv6_dirport().
+ * If there is no node, use reachable_addr_prefer_ipv6_dirport().
  */
 int
 node_ipv6_dir_preferred(const node_t *node)
@@ -1783,15 +1902,15 @@ node_ipv6_dir_preferred(const node_t *node)
   tor_addr_port_t ipv4_addr;
   node_assert_ok(node);
 
-  /* node->ipv6_preferred is set from fascist_firewall_prefer_ipv6_orport(),
+  /* node->ipv6_preferred is set from reachable_addr_prefer_ipv6_orport(),
    * so we can't use it to determine DirPort IPv6 preference.
    * This means that bridge clients will use IPv4 DirPorts by default.
    */
   node_get_prim_dirport(node, &ipv4_addr);
-  if (!fascist_firewall_use_ipv6(options)) {
+  if (!reachable_addr_use_ipv6(options)) {
     return 0;
   } else if (!tor_addr_port_is_valid_ap(&ipv4_addr, 0)
-      || fascist_firewall_prefer_ipv6_dirport(get_options())) {
+      || reachable_addr_prefer_ipv6_dirport(get_options())) {
     return node_has_ipv6_dirport(node);
   }
   return 0;
@@ -1813,8 +1932,8 @@ node_get_prim_dirport(const node_t *node, tor_addr_port_t *ap_out)
   /* Check ri first, because rewrite_node_address_for_bridge() updates
    * node->ri with the configured bridge address. */
 
-  RETURN_IPV4_AP(node->ri, dir_port, ap_out);
-  RETURN_IPV4_AP(node->rs, dir_port, ap_out);
+  RETURN_IPV4_AP(node->ri, ipv4_dirport, ap_out);
+  RETURN_IPV4_AP(node->rs, ipv4_dirport, ap_out);
   /* Microdescriptors only have an IPv6 address */
 }
 
@@ -1851,13 +1970,13 @@ node_get_pref_ipv6_dirport(const node_t *node, tor_addr_port_t *ap_out)
 
   /* Assume IPv4 and IPv6 dirports are the same */
   if (node->ri && tor_addr_port_is_valid(&node->ri->ipv6_addr,
-                                         node->ri->dir_port, 0)) {
+                                         node->ri->ipv4_dirport, 0)) {
     tor_addr_copy(&ap_out->addr, &node->ri->ipv6_addr);
-    ap_out->port = node->ri->dir_port;
+    ap_out->port = node->ri->ipv4_dirport;
   } else if (node->rs && tor_addr_port_is_valid(&node->rs->ipv6_addr,
-                                                node->rs->dir_port, 0)) {
+                                                node->rs->ipv4_dirport, 0)) {
     tor_addr_copy(&ap_out->addr, &node->rs->ipv6_addr);
-    ap_out->port = node->rs->dir_port;
+    ap_out->port = node->rs->ipv4_dirport;
   } else {
     tor_addr_make_null(&ap_out->addr, AF_INET6);
     ap_out->port = 0;
@@ -1877,7 +1996,7 @@ microdesc_has_curve25519_onion_key(const microdesc_t *md)
     return 0;
   }
 
-  if (tor_mem_is_zero((const char*)md->onion_curve25519_pkey->public_key,
+  if (fast_mem_is_zero((const char*)md->onion_curve25519_pkey->public_key,
                       CURVE25519_PUBKEY_LEN)) {
     return 0;
   }
@@ -1909,7 +2028,7 @@ node_get_curve25519_onion_key(const node_t *node)
 /* Return a newly allocacted RSA onion public key taken from the given node.
  *
  * Return NULL if node is NULL or no RSA onion public key can be found. It is
- * the caller responsability to free the returned object. */
+ * the caller responsibility to free the returned object. */
 crypto_pk_t *
 node_get_rsa_onion_key(const node_t *node)
 {
@@ -1942,22 +2061,28 @@ node_get_rsa_onion_key(const node_t *node)
 void
 node_set_country(node_t *node)
 {
-  tor_addr_t addr = TOR_ADDR_NULL;
+  const tor_addr_t *ipv4_addr = NULL;
 
   /* XXXXipv6 */
   if (node->rs)
-    tor_addr_from_ipv4h(&addr, node->rs->addr);
+    ipv4_addr = &node->rs->ipv4_addr;
   else if (node->ri)
-    tor_addr_from_ipv4h(&addr, node->ri->addr);
+    ipv4_addr = &node->ri->ipv4_addr;
 
-  node->country = geoip_get_country_by_addr(&addr);
+  /* IPv4 is mandatory for a relay so this should not happen unless we are
+   * attempting to set the country code on a node without a descriptor. */
+  if (BUG(!ipv4_addr)) {
+    node->country = -1;
+    return;
+  }
+  node->country = geoip_get_country_by_addr(ipv4_addr);
 }
 
 /** Set the country code of all routers in the routerlist. */
 void
 nodelist_refresh_countries(void)
 {
-  smartlist_t *nodes = nodelist_get_list();
+  const smartlist_t *nodes = nodelist_get_list();
   SMARTLIST_FOREACH(nodes, node_t *, node,
                     node_set_country(node));
 }
@@ -1965,9 +2090,12 @@ nodelist_refresh_countries(void)
 /** Return true iff router1 and router2 have similar enough network addresses
  * that we should treat them as being in the same family */
 int
-addrs_in_same_network_family(const tor_addr_t *a1,
+router_addrs_in_same_network(const tor_addr_t *a1,
                              const tor_addr_t *a2)
 {
+  if (tor_addr_is_null(a1) || tor_addr_is_null(a2))
+    return 0;
+
   switch (tor_addr_family(a1)) {
     case AF_INET:
       return 0 == tor_addr_compare_masked(a1, a2, 16, CMP_SEMANTIC);
@@ -1983,7 +2111,7 @@ addrs_in_same_network_family(const tor_addr_t *a1,
  * (case-insensitive), or if <b>node's</b> identity key digest
  * matches a hexadecimal value stored in <b>nickname</b>.  Return
  * false otherwise. */
-static int
+STATIC int
 node_nickname_matches(const node_t *node, const char *nickname)
 {
   const char *n = node_get_nickname(node);
@@ -1995,7 +2123,7 @@ node_nickname_matches(const node_t *node, const char *nickname)
 }
 
 /** Return true iff <b>node</b> is named by some nickname in <b>lst</b>. */
-static inline int
+STATIC int
 node_in_nickname_smartlist(const smartlist_t *lst, const node_t *node)
 {
   if (!lst) return 0;
@@ -2004,6 +2132,61 @@ node_in_nickname_smartlist(const smartlist_t *lst, const node_t *node)
       return 1;
   });
   return 0;
+}
+
+/** Return true iff n1's declared family contains n2. */
+STATIC int
+node_family_contains(const node_t *n1, const node_t *n2)
+{
+  if (n1->ri && n1->ri->declared_family) {
+    return node_in_nickname_smartlist(n1->ri->declared_family, n2);
+  } else if (n1->md) {
+    return nodefamily_contains_node(n1->md->family, n2);
+  } else {
+    return 0;
+  }
+}
+
+/**
+ * Return true iff <b>node</b> has declared a nonempty family.
+ **/
+STATIC bool
+node_has_declared_family(const node_t *node)
+{
+  if (node->ri && node->ri->declared_family &&
+      smartlist_len(node->ri->declared_family)) {
+    return true;
+  }
+
+  if (node->md && node->md->family) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Add to <b>out</b> every node_t that is listed by <b>node</b> as being in
+ * its family.  (Note that these nodes are not in node's family unless they
+ * also agree that node is in their family.)
+ **/
+STATIC void
+node_lookup_declared_family(smartlist_t *out, const node_t *node)
+{
+  if (node->ri && node->ri->declared_family &&
+      smartlist_len(node->ri->declared_family)) {
+    SMARTLIST_FOREACH_BEGIN(node->ri->declared_family, const char *, name) {
+      const node_t *n2 = node_get_by_nickname(name, NNF_NO_WARN_UNNAMED);
+      if (n2) {
+        smartlist_add(out, (node_t *)n2);
+      }
+    } SMARTLIST_FOREACH_END(name);
+    return;
+  }
+
+  if (node->md && node->md->family) {
+    nodefamily_add_nodes_to_smartlist(node->md->family, out);
+  }
 }
 
 /** Return true iff r1 and r2 are in the same family, but not the same
@@ -2018,19 +2201,20 @@ nodes_in_same_family(const node_t *node1, const node_t *node2)
     tor_addr_t a1, a2;
     node_get_addr(node1, &a1);
     node_get_addr(node2, &a2);
-    if (addrs_in_same_network_family(&a1, &a2))
+
+    tor_addr_port_t ap6_1, ap6_2;
+    node_get_pref_ipv6_orport(node1, &ap6_1);
+    node_get_pref_ipv6_orport(node2, &ap6_2);
+
+    if (router_addrs_in_same_network(&a1, &a2) ||
+        router_addrs_in_same_network(&ap6_1.addr, &ap6_2.addr))
       return 1;
   }
 
   /* Are they in the same family because the agree they are? */
-  {
-    const smartlist_t *f1, *f2;
-    f1 = node_get_declared_family(node1);
-    f2 = node_get_declared_family(node2);
-    if (f1 && f2 &&
-        node_in_nickname_smartlist(f1, node2) &&
-        node_in_nickname_smartlist(f2, node1))
-      return 1;
+  if (node_family_contains(node1, node2) &&
+      node_family_contains(node2, node1)) {
+    return 1;
   }
 
   /* Are they in the same family because the user says they are? */
@@ -2058,12 +2242,9 @@ void
 nodelist_add_node_and_family(smartlist_t *sl, const node_t *node)
 {
   const smartlist_t *all_nodes = nodelist_get_list();
-  const smartlist_t *declared_family;
   const or_options_t *options = get_options();
 
   tor_assert(node);
-
-  declared_family = node_get_declared_family(node);
 
   /* Let's make sure that we have the node itself, if it's a real node. */
   {
@@ -2075,35 +2256,35 @@ nodelist_add_node_and_family(smartlist_t *sl, const node_t *node)
   /* First, add any nodes with similar network addresses. */
   if (options->EnforceDistinctSubnets) {
     tor_addr_t node_addr;
+    tor_addr_port_t node_ap6;
     node_get_addr(node, &node_addr);
+    node_get_pref_ipv6_orport(node, &node_ap6);
 
     SMARTLIST_FOREACH_BEGIN(all_nodes, const node_t *, node2) {
       tor_addr_t a;
+      tor_addr_port_t ap6;
       node_get_addr(node2, &a);
-      if (addrs_in_same_network_family(&a, &node_addr))
+      node_get_pref_ipv6_orport(node2, &ap6);
+      if (router_addrs_in_same_network(&a, &node_addr) ||
+          router_addrs_in_same_network(&ap6.addr, &node_ap6.addr))
         smartlist_add(sl, (void*)node2);
     } SMARTLIST_FOREACH_END(node2);
   }
 
-  /* Now, add all nodes in the declared_family of this node, if they
+  /* Now, add all nodes in the declared family of this node, if they
    * also declare this node to be in their family. */
-  if (declared_family) {
+  if (node_has_declared_family(node)) {
+    smartlist_t *declared_family = smartlist_new();
+    node_lookup_declared_family(declared_family, node);
+
     /* Add every r such that router declares familyness with node, and node
      * declares familyhood with router. */
-    SMARTLIST_FOREACH_BEGIN(declared_family, const char *, name) {
-      const node_t *node2;
-      const smartlist_t *family2;
-      if (!(node2 = node_get_by_nickname(name, NNF_NO_WARN_UNNAMED)))
-        continue;
-      if (!(family2 = node_get_declared_family(node2)))
-        continue;
-      SMARTLIST_FOREACH_BEGIN(family2, const char *, name2) {
-          if (node_nickname_matches(node, name2)) {
-            smartlist_add(sl, (void*)node2);
-            break;
-          }
-      } SMARTLIST_FOREACH_END(name2);
-    } SMARTLIST_FOREACH_END(name);
+    SMARTLIST_FOREACH_BEGIN(declared_family, const node_t *, node2) {
+      if (node_family_contains(node2, node)) {
+        smartlist_add(sl, (void*)node2);
+      }
+    } SMARTLIST_FOREACH_END(node2);
+    smartlist_free(declared_family);
   }
 
   /* If the user declared any families locally, honor those too. */
@@ -2125,21 +2306,18 @@ nodelist_add_node_and_family(smartlist_t *sl, const node_t *node)
 const node_t *
 router_find_exact_exit_enclave(const char *address, uint16_t port)
 {/*XXXX MOVE*/
-  uint32_t addr;
   struct in_addr in;
-  tor_addr_t a;
+  tor_addr_t ipv4_addr;
   const or_options_t *options = get_options();
 
   if (!tor_inet_aton(address, &in))
     return NULL; /* it's not an IP already */
-  addr = ntohl(in.s_addr);
-
-  tor_addr_from_ipv4h(&a, addr);
+  tor_addr_from_in(&ipv4_addr, &in);
 
   SMARTLIST_FOREACH(nodelist_get_list(), const node_t *, node, {
-    if (node_get_addr_ipv4h(node) == addr &&
+    if (tor_addr_eq(node_get_prim_addr_ipv4(node), &ipv4_addr) &&
         node->is_running &&
-        compare_tor_addr_to_node_policy(&a, port, node) ==
+        compare_tor_addr_to_node_policy(&ipv4_addr, port, node) ==
           ADDR_POLICY_ACCEPTED &&
         !routerset_contains_node(options->ExcludeExitNodesUnion_, node))
       return node;
@@ -2292,7 +2470,6 @@ void
 router_dir_info_changed(void)
 {
   need_to_update_have_min_dir_info = 1;
-  rend_hsdir_routers_changed();
   hs_service_dir_info_changed();
   hs_client_dir_info_changed();
 }
@@ -2408,7 +2585,7 @@ compute_frac_paths_available(const networkstatus_t *consensus,
   const int authdir = authdir_mode_v3(options);
 
   count_usable_descriptors(num_present_out, num_usable_out,
-                           mid, consensus, now, NULL,
+                           mid, consensus, now, options->MiddleNodes,
                            USABLE_DESCRIPTOR_ALL);
   log_debug(LD_NET,
             "%s: %d present, %d usable",
@@ -2610,7 +2787,7 @@ count_loading_descriptors_progress(void)
   if (fraction > 1.0)
     return 0; /* it's not the number of descriptors holding us back */
   return BOOTSTRAP_STATUS_LOADING_DESCRIPTORS + (int)
-    (fraction*(BOOTSTRAP_STATUS_CONN_OR-1 -
+    (fraction*(BOOTSTRAP_STATUS_ENOUGH_DIRINFO-1 -
                BOOTSTRAP_STATUS_LOADING_DESCRIPTORS));
 }
 
@@ -2697,14 +2874,14 @@ update_router_have_minimum_dir_info(void)
   /* If paths have just become available in this update. */
   if (res && !have_min_dir_info) {
     control_event_client_status(LOG_NOTICE, "ENOUGH_DIR_INFO");
-    control_event_boot_dir(BOOTSTRAP_STATUS_CONN_OR, 0);
+    control_event_boot_dir(BOOTSTRAP_STATUS_ENOUGH_DIRINFO, 0);
     log_info(LD_DIR,
              "We now have enough directory information to build circuits.");
   }
 
   /* If paths have just become unavailable in this update. */
   if (!res && have_min_dir_info) {
-    int quiet = directory_too_idle_to_fetch_descriptors(options, now);
+    int quiet = dirclient_too_idle_to_fetch_descriptors(options, now);
     tor_log(quiet ? LOG_INFO : LOG_NOTICE, LD_DIR,
         "Our directory information is no longer up-to-date "
         "enough to build circuits: %s", dir_info_status);

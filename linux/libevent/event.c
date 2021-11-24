@@ -2605,7 +2605,7 @@ event_remove_timer_nolock_(struct event *ev)
 	/* If it's not pending on a timeout, we don't need to do anything. */
 	if (ev->ev_flags & EVLIST_TIMEOUT) {
 		event_queue_remove_timeout(base, ev);
-		evutil_timerclear(&ev->ev_.ev_io.ev_timeout);
+		evutil_timerclear(&ev->ev_io_timeout);
 	}
 
 	return (0);
@@ -3376,7 +3376,7 @@ insert_common_timeout_inorder(struct common_timeout_list *ctl,
 	/* By all logic, we should just be able to append 'ev' to the end of
 	 * ctl->events, since the timeout on each 'ev' is set to {the common
 	 * timeout} + {the time when we add the event}, and so the events
-	 * should arrive in order of their timeeouts.  But just in case
+	 * should arrive in order of their timeouts.  But just in case
 	 * there's some wacky threading issue going on, we do a search from
 	 * the end of 'ev' to find the right insertion point.
 	 */

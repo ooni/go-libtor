@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -32,8 +32,8 @@ const node_t *node_get_by_hex_id(const char *identity_digest,
                                  unsigned flags);
 node_t *nodelist_set_routerinfo(routerinfo_t *ri, routerinfo_t **ri_old_out);
 node_t *nodelist_add_microdesc(microdesc_t *md);
-void nodelist_set_consensus(networkstatus_t *ns);
-void nodelist_ensure_freshness(networkstatus_t *ns);
+void nodelist_set_consensus(const networkstatus_t *ns);
+void nodelist_ensure_freshness(const networkstatus_t *ns);
 int nodelist_probably_contains_address(const tor_addr_t *addr);
 bool nodelist_reentry_contains(const tor_addr_t *addr, uint16_t port);
 void nodelist_add_addr_to_address_set(const tor_addr_t *addr,
@@ -68,19 +68,29 @@ smartlist_t *node_get_all_orports(const node_t *node);
 int node_allows_single_hop_exits(const node_t *node);
 const char *node_get_nickname(const node_t *node);
 const char *node_get_platform(const node_t *node);
-uint32_t node_get_prim_addr_ipv4h(const node_t *node);
 void node_get_address_string(const node_t *node, char *cp, size_t len);
 long node_get_declared_uptime(const node_t *node);
-const smartlist_t *node_get_declared_family(const node_t *node);
-const struct ed25519_public_key_t *node_get_ed25519_id(const node_t *node);
+MOCK_DECL(const struct ed25519_public_key_t *,node_get_ed25519_id,
+          (const node_t *node));
 int node_ed25519_id_matches(const node_t *node,
                             const struct ed25519_public_key_t *id);
-int node_supports_ed25519_link_authentication(const node_t *node,
-                                              int compatible_with_us);
-int node_supports_v3_hsdir(const node_t *node);
-int node_supports_ed25519_hs_intro(const node_t *node);
-int node_supports_v3_rendezvous_point(const node_t *node);
+MOCK_DECL(bool,node_supports_ed25519_link_authentication,
+          (const node_t *node,
+           bool compatible_with_us));
+bool node_supports_v3_hsdir(const node_t *node);
+bool node_supports_ed25519_hs_intro(const node_t *node);
+bool node_supports_v3_rendezvous_point(const node_t *node);
+bool node_supports_establish_intro_dos_extension(const node_t *node);
+bool node_supports_initiating_ipv6_extends(const node_t *node);
+bool node_supports_accepting_ipv6_extends(const node_t *node,
+                                          bool need_canonical_ipv6_conn);
+
 const uint8_t *node_get_rsa_id_digest(const node_t *node);
+MOCK_DECL(smartlist_t *,node_get_link_specifier_smartlist,(const node_t *node,
+                                                           bool direct_conn));
+void link_specifier_smartlist_free_(smartlist_t *ls_list);
+#define link_specifier_smartlist_free(ls_list) \
+  FREE_AND_NULL(smartlist_t, link_specifier_smartlist_free_, (ls_list))
 
 int node_has_ipv6_addr(const node_t *node);
 int node_has_ipv6_orport(const node_t *node);
@@ -100,11 +110,10 @@ const struct curve25519_public_key_t *node_get_curve25519_onion_key(
                                   const node_t *node);
 crypto_pk_t *node_get_rsa_onion_key(const node_t *node);
 
-MOCK_DECL(smartlist_t *, nodelist_get_list, (void));
+MOCK_DECL(const smartlist_t *, nodelist_get_list, (void));
 
 /* Temporary during transition to multiple addresses.  */
 void node_get_addr(const node_t *node, tor_addr_t *addr_out);
-#define node_get_addr_ipv4h(n) node_get_prim_addr_ipv4h((n))
 
 void nodelist_refresh_countries(void);
 void node_set_country(node_t *node);
@@ -118,7 +127,7 @@ int node_is_unreliable(const node_t *router, int need_uptime,
 int router_exit_policy_all_nodes_reject(const tor_addr_t *addr, uint16_t port,
                                         int need_uptime);
 void router_set_status(const char *digest, int up);
-int addrs_in_same_network_family(const tor_addr_t *a1,
+int router_addrs_in_same_network(const tor_addr_t *a1,
                                  const tor_addr_t *a2);
 
 /** router_have_minimum_dir_info tests to see if we have enough
@@ -158,10 +167,16 @@ int count_loading_descriptors_progress(void);
 
 #ifdef NODELIST_PRIVATE
 
+STATIC int node_nickname_matches(const node_t *node, const char *nickname);
+STATIC int node_in_nickname_smartlist(const smartlist_t *lst,
+                                      const node_t *node);
+STATIC int node_family_contains(const node_t *n1, const node_t *n2);
+STATIC bool node_has_declared_family(const node_t *node);
+STATIC void node_lookup_declared_family(smartlist_t *out, const node_t *node);
+
 #ifdef TOR_UNIT_TESTS
 
-STATIC void
-node_set_hsdir_index(node_t *node, const networkstatus_t *ns);
+STATIC void node_set_hsdir_index(node_t *node, const networkstatus_t *ns);
 
 #endif /* defined(TOR_UNIT_TESTS) */
 

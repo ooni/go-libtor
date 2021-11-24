@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2019, The Tor Project, Inc. */
+/* Copyright (c) 2013-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -102,7 +102,7 @@ static const ed25519_impl_t impl_donna = {
 
   ed25519_donna_open,
   ed25519_donna_sign,
-  ed25519_sign_open_batch_donna,
+  NULL, /* Don't use donna's batching code because of #40078 */
 
   ed25519_donna_blind_secret_key,
   ed25519_donna_blind_public_key,
@@ -226,7 +226,7 @@ ed25519_keypair_generate(ed25519_keypair_t *keypair_out, int extra_strong)
 int
 ed25519_public_key_is_zero(const ed25519_public_key_t *pubkey)
 {
-  return tor_mem_is_zero((char*)pubkey->pubkey, ED25519_PUBKEY_LEN);
+  return safe_mem_is_zero((char*)pubkey->pubkey, ED25519_PUBKEY_LEN);
 }
 
 /* Return a heap-allocated array that contains <b>msg</b> prefixed by the

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
-n * Copyright (c) 2001-2004, Roger Dingledine.
+ * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -17,7 +17,7 @@ n * Copyright (c) 2001-2004, Roger Dingledine.
  *
  * Routersets are typically used for user-specified restrictions, and
  * are created by invoking routerset_new and routerset_parse from
- * config.c and confparse.c.  To use a routerset, invoke one of
+ * config.c and confmgt.c.  To use a routerset, invoke one of
  * routerset_contains_...() functions , or use
  * routerstatus_get_all_nodes() / routerstatus_subtract_nodes() to
  * manipulate a smartlist of node_t pointers.
@@ -34,6 +34,9 @@ n * Copyright (c) 2001-2004, Roger Dingledine.
 #include "feature/nodelist/nickname.h"
 #include "feature/nodelist/nodelist.h"
 #include "feature/nodelist/routerset.h"
+#include "lib/conf/conftypes.h"
+#include "lib/confmgt/typedvar.h"
+#include "lib/encoding/confline.h"
 #include "lib/geoip/geoip.h"
 
 #include "core/or/addr_policy_st.h"
@@ -41,6 +44,7 @@ n * Copyright (c) 2001-2004, Roger Dingledine.
 #include "feature/nodelist/node_st.h"
 #include "feature/nodelist/routerinfo_st.h"
 #include "feature/nodelist/routerstatus_st.h"
+#include "lib/confmgt/var_type_def_st.h"
 
 /** Return a new empty routerset. */
 routerset_t *
@@ -52,6 +56,7 @@ routerset_new(void)
   result->digests = digestmap_new();
   result->policies = smartlist_new();
   result->country_names = smartlist_new();
+  result->fragile = 0;
   return result;
 }
 
@@ -219,11 +224,11 @@ routerset_len(const routerset_t *set)
  *
  * (If country is -1, then we take the country
  * from addr.) */
-STATIC int
-routerset_contains(const routerset_t *set, const tor_addr_t *addr,
-                   uint16_t orport,
-                   const char *nickname, const char *id_digest,
-                   country_t country)
+static int
+routerset_contains2(const routerset_t *set, const tor_addr_t *addr,
+                    uint16_t orport, const tor_addr_t *addr2,
+                    uint16_t orport2, const char *nickname,
+                    const char *id_digest, country_t country)
 {
   if (!set || !set->list)
     return 0;
@@ -232,6 +237,9 @@ routerset_contains(const routerset_t *set, const tor_addr_t *addr,
   if (id_digest && digestmap_get(set->digests, id_digest))
     return 4;
   if (addr && compare_tor_addr_to_addr_policy(addr, orport, set->policies)
+      == ADDR_POLICY_REJECTED)
+    return 3;
+  if (addr2 && compare_tor_addr_to_addr_policy(addr2, orport2, set->policies)
       == ADDR_POLICY_REJECTED)
     return 3;
   if (set->countries) {
@@ -243,6 +251,17 @@ routerset_contains(const routerset_t *set, const tor_addr_t *addr,
       return 2;
   }
   return 0;
+}
+
+/** Helper. Like routerset_contains2() but for a single IP/port combo.
+ */
+STATIC int
+routerset_contains(const routerset_t *set, const tor_addr_t *addr,
+                   uint16_t orport, const char *nickname,
+                   const char *id_digest, country_t country)
+{
+  return routerset_contains2(set, addr, orport, NULL, 0,
+                             nickname, id_digest, country);
 }
 
 /** If *<b>setp</b> includes at least one country code, or if
@@ -288,12 +307,19 @@ routerset_add_unknown_ccs(routerset_t **setp, int only_if_some_cc_set)
 int
 routerset_contains_extendinfo(const routerset_t *set, const extend_info_t *ei)
 {
-  return routerset_contains(set,
-                            &ei->addr,
-                            ei->port,
-                            ei->nickname,
-                            ei->identity_digest,
-                            -1 /*country*/);
+  const tor_addr_port_t *ap1 = NULL, *ap2 = NULL;
+  if (! tor_addr_is_null(&ei->orports[0].addr))
+    ap1 = &ei->orports[0];
+  if (! tor_addr_is_null(&ei->orports[1].addr))
+    ap2 = &ei->orports[1];
+  return routerset_contains2(set,
+                             ap1 ? &ap1->addr : NULL,
+                             ap1 ? ap1->port : 0,
+                             ap2 ? &ap2->addr : NULL,
+                             ap2 ? ap2->port : 0,
+                             ei->nickname,
+                             ei->identity_digest,
+                             -1 /*country*/);
 }
 
 /** Return true iff <b>ri</b> is in <b>set</b>.  If country is <b>-1</b>, we
@@ -302,14 +328,9 @@ int
 routerset_contains_router(const routerset_t *set, const routerinfo_t *ri,
                           country_t country)
 {
-  tor_addr_t addr;
-  tor_addr_from_ipv4h(&addr, ri->addr);
-  return routerset_contains(set,
-                            &addr,
-                            ri->or_port,
-                            ri->nickname,
-                            ri->cache_info.identity_digest,
-                            country);
+  return routerset_contains2(set, &ri->ipv4_addr, ri->ipv4_orport,
+                             &ri->ipv6_addr, ri->ipv6_orport, ri->nickname,
+                             ri->cache_info.identity_digest, country);
 }
 
 /** Return true iff <b>rs</b> is in <b>set</b>.  If country is <b>-1</b>, we
@@ -319,11 +340,9 @@ routerset_contains_routerstatus(const routerset_t *set,
                                 const routerstatus_t *rs,
                                 country_t country)
 {
-  tor_addr_t addr;
-  tor_addr_from_ipv4h(&addr, rs->addr);
   return routerset_contains(set,
-                            &addr,
-                            rs->or_port,
+                            &rs->ipv4_addr,
+                            rs->ipv4_orport,
                             rs->nickname,
                             rs->identity_digest,
                             country);
@@ -378,7 +397,7 @@ routerset_get_all_nodes(smartlist_t *out, const routerset_t *routerset,
   } else {
     /* We need to iterate over the routerlist to get all the ones of the
      * right kind. */
-    smartlist_t *nodes = nodelist_get_list();
+    const smartlist_t *nodes = nodelist_get_list();
     SMARTLIST_FOREACH(nodes, const node_t *, node, {
         if (running_only && !node->is_running)
           continue;
@@ -461,3 +480,133 @@ routerset_free_(routerset_t *routerset)
   bitarray_free(routerset->countries);
   tor_free(routerset);
 }
+
+/**
+ * config helper: parse a routerset-typed variable.
+ *
+ * Takes as input as a single line in <b>line</b>; writes its results into a
+ * routerset_t** passed as <b>target</b>.  On success return 0; on failure
+ * return -1 and store an error message into *<b>errmsg</b>.
+ **/
+/*
+ * Warning: For this type, the default value (NULL) and "" are sometimes
+ * considered different values.  That is generally risky, and best avoided for
+ * other types in the future.  For cases where we want the default to be "all
+ * routers" (like EntryNodes) we should add a new routerset value indicating
+ * "all routers" (see #31908)
+ */
+static int
+routerset_kv_parse(void *target, const config_line_t *line, char **errmsg,
+                  const void *params)
+{
+  (void)params;
+  routerset_t **lines = target;
+
+  if (*lines && (*lines)->fragile) {
+    if (line->command == CONFIG_LINE_APPEND) {
+      (*lines)->fragile = 0;
+    } else {
+      routerset_free(*lines); // Represent empty sets as NULL
+    }
+  }
+
+  int ret;
+  routerset_t *rs = routerset_new();
+  if (routerset_parse(rs, line->value, line->key) < 0) {
+    *errmsg = tor_strdup("Invalid router list.");
+    ret = -1;
+  } else {
+    if (!routerset_is_empty(rs)) {
+      if (!*lines) {
+        *lines = routerset_new();
+      }
+      routerset_union(*lines, rs);
+    }
+    ret = 0;
+  }
+  routerset_free(rs);
+  return ret;
+}
+
+/**
+ * config helper: encode a routerset-typed variable.
+ *
+ * Return a newly allocated string containing the value of the
+ * routerset_t** passed as <b>value</b>.
+ */
+static char *
+routerset_encode(const void *value, const void *params)
+{
+  (void)params;
+  const routerset_t **p = (const routerset_t**)value;
+  return routerset_to_string(*p);
+}
+
+/**
+ * config helper: free and clear a routerset-typed variable.
+ *
+ * Clear the routerset_t** passed as <b>value</b>.
+ */
+static void
+routerset_clear(void *value, const void *params)
+{
+  (void)params;
+  routerset_t **p = (routerset_t**)value;
+  routerset_free(*p); // sets *p to NULL.
+}
+
+/**
+ * config helper: copy a routerset-typed variable.
+ *
+ * Takes it input from a routerset_t** in <b>src</b>; writes its output to a
+ * routerset_t** in <b>dest</b>.  Returns 0 on success, -1 on (impossible)
+ * failure.
+ **/
+static int
+routerset_copy(void *dest, const void *src, const void *params)
+{
+  (void)params;
+  routerset_t **output = (routerset_t**)dest;
+  const routerset_t *input = *(routerset_t**)src;
+  routerset_free(*output); // sets *output to NULL
+  if (! routerset_is_empty(input)) {
+    *output = routerset_new();
+    routerset_union(*output, input);
+  }
+  return 0;
+}
+
+static void
+routerset_mark_fragile(void *target, const void *params)
+{
+  (void)params;
+  routerset_t **ptr = (routerset_t **)target;
+  if (*ptr)
+    (*ptr)->fragile = 1;
+}
+
+/**
+ * Function table to implement a routerset_t-based configuration type.
+ **/
+static const var_type_fns_t routerset_type_fns = {
+  .kv_parse = routerset_kv_parse,
+  .encode = routerset_encode,
+  .clear = routerset_clear,
+  .copy = routerset_copy,
+  .mark_fragile = routerset_mark_fragile,
+};
+
+/**
+ * Definition of a routerset_t-based configuration type.
+ *
+ * Values are mapped to and from strings using the format defined in
+ * routerset_parse(): nicknames, IP address patterns, and fingerprints--with
+ * optional space, separated by commas.
+ *
+ * Empty sets are represented as NULL.
+ **/
+const var_type_def_t ROUTERSET_type_defn = {
+  .name = "RouterList",
+  .fns = &routerset_type_fns,
+  .flags = CFLG_NOREPLACE
+};

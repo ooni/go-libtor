@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -15,6 +15,25 @@
 #include "lib/crypt_ops/crypto_util.h"
 
 #include "core/or/tor_version_st.h"
+
+/**
+ * Return the approximate date when this release came out, or was
+ * scheduled to come out, according to the APPROX_RELEASE_DATE set in
+ * configure.ac
+ **/
+time_t
+tor_get_approx_release_date(void)
+{
+  char tbuf[ISO_TIME_LEN+1];
+  tor_snprintf(tbuf, sizeof(tbuf),
+               "%s 00:00:00", APPROX_RELEASE_DATE);
+  time_t result = 0;
+  int r = parse_iso_time(tbuf, &result);
+  if (BUG(r < 0)) {
+    result = 0;
+  }
+  return result;
+}
 
 /** Return VS_RECOMMENDED if <b>myversion</b> is contained in
  * <b>versionlist</b>.  Else, return VS_EMPTY if versionlist has no
@@ -277,7 +296,7 @@ tor_version_parse(const char *s, tor_version_t *out)
       return -1;
     hexlen = (int)(close_paren-cp);
     memwipe(digest, 0, sizeof(digest));
-    if ( hexlen == 0 || (hexlen % 2) == 1)
+    if (hexlen == 0 || (hexlen % 2) == 1)
       return -1;
     if (base16_decode(digest, hexlen/2, cp, hexlen) != hexlen/2)
       return -1;
@@ -377,8 +396,106 @@ sort_version_list(smartlist_t *versions, int remove_duplicates)
     smartlist_uniq(versions, compare_tor_version_str_ptr_, tor_free_);
 }
 
+/** If there are more than this many entries, we're probably under
+ * some kind of weird DoS. */
+static const int MAX_PROTOVER_SUMMARY_MAP_LEN = 1024;
+
+/**
+ * Map from protover string to protover_summary_flags_t.
+ */
+static strmap_t *protover_summary_map = NULL;
+
+/**
+ * Helper.  Given a non-NULL protover string <b>protocols</b>, set <b>out</b>
+ * to its summary, and memoize the result in <b>protover_summary_map</b>.
+ *
+ * If the protover string does not contain any recognised protocols, sets
+ * protocols_known, but does not set any other flags. (Empty strings are also
+ * treated this way.)
+ */
+static void
+memoize_protover_summary(protover_summary_flags_t *out,
+                         const char *protocols)
+{
+  if (!protover_summary_map)
+    protover_summary_map = strmap_new();
+
+  if (strmap_size(protover_summary_map) >= MAX_PROTOVER_SUMMARY_MAP_LEN) {
+    protover_summary_cache_free_all();
+    tor_assert(protover_summary_map == NULL);
+    protover_summary_map = strmap_new();
+  }
+
+  const protover_summary_flags_t *cached =
+    strmap_get(protover_summary_map, protocols);
+
+  if (cached != NULL) {
+    /* We found a cached entry; no need to parse this one. */
+    memcpy(out, cached, sizeof(protover_summary_flags_t));
+    tor_assert(out->protocols_known);
+    return;
+  }
+
+  memset(out, 0, sizeof(*out));
+  out->protocols_known = 1;
+
+  out->supports_ed25519_link_handshake_compat =
+    protocol_list_supports_protocol(protocols, PRT_LINKAUTH,
+                                    PROTOVER_LINKAUTH_ED25519_HANDSHAKE);
+  out->supports_ed25519_link_handshake_any =
+    protocol_list_supports_protocol_or_later(
+                                     protocols,
+                                     PRT_LINKAUTH,
+                                     PROTOVER_LINKAUTH_ED25519_HANDSHAKE);
+
+  out->supports_extend2_cells =
+    protocol_list_supports_protocol(protocols, PRT_RELAY,
+                                    PROTOVER_RELAY_EXTEND2);
+  out->supports_accepting_ipv6_extends = (
+    protocol_list_supports_protocol(protocols, PRT_RELAY,
+                                    PROTOVER_RELAY_ACCEPT_IPV6) ||
+    protocol_list_supports_protocol(protocols, PRT_RELAY,
+                                    PROTOVER_RELAY_EXTEND_IPV6));
+  out->supports_initiating_ipv6_extends =
+    protocol_list_supports_protocol(protocols, PRT_RELAY,
+                                    PROTOVER_RELAY_EXTEND_IPV6);
+  out->supports_canonical_ipv6_conns =
+    protocol_list_supports_protocol(protocols, PRT_RELAY,
+                                    PROTOVER_RELAY_CANONICAL_IPV6);
+
+  out->supports_ed25519_hs_intro =
+    protocol_list_supports_protocol(protocols, PRT_HSINTRO,
+                                    PROTOVER_HS_INTRO_V3);
+  out->supports_establish_intro_dos_extension =
+    protocol_list_supports_protocol(protocols, PRT_HSINTRO,
+                                    PROTOVER_HS_INTRO_DOS);
+
+  out->supports_v3_rendezvous_point =
+    protocol_list_supports_protocol(protocols, PRT_HSREND,
+                                    PROTOVER_HS_RENDEZVOUS_POINT_V3);
+
+  out->supports_v3_hsdir =
+    protocol_list_supports_protocol(protocols, PRT_HSDIR,
+                                    PROTOVER_HSDIR_V3);
+
+  out->supports_hs_setup_padding =
+    protocol_list_supports_protocol(protocols, PRT_PADDING,
+                                    PROTOVER_HS_SETUP_PADDING);
+
+  protover_summary_flags_t *new_cached = tor_memdup(out, sizeof(*out));
+  cached = strmap_set(protover_summary_map, protocols, new_cached);
+  tor_assert(!cached);
+}
+
 /** Summarize the protocols listed in <b>protocols</b> into <b>out</b>,
  * falling back or correcting them based on <b>version</b> as appropriate.
+ *
+ * If protocols and version are both NULL or "", returns a summary with no
+ * flags set.
+ *
+ * If the protover string does not contain any recognised protocols, and the
+ * version is not recognised, sets protocols_known, but does not set any other
+ * flags. (Empty strings are also treated this way.)
  */
 void
 summarize_protover_flags(protover_summary_flags_t *out,
@@ -387,24 +504,10 @@ summarize_protover_flags(protover_summary_flags_t *out,
 {
   tor_assert(out);
   memset(out, 0, sizeof(*out));
-  if (protocols) {
-    out->protocols_known = 1;
-    out->supports_extend2_cells =
-      protocol_list_supports_protocol(protocols, PRT_RELAY, 2);
-    out->supports_ed25519_link_handshake_compat =
-      protocol_list_supports_protocol(protocols, PRT_LINKAUTH, 3);
-    out->supports_ed25519_link_handshake_any =
-      protocol_list_supports_protocol_or_later(protocols, PRT_LINKAUTH, 3);
-    out->supports_ed25519_hs_intro =
-      protocol_list_supports_protocol(protocols, PRT_HSINTRO, 4);
-    out->supports_v3_hsdir =
-      protocol_list_supports_protocol(protocols, PRT_HSDIR,
-                                      PROTOVER_HSDIR_V3);
-    out->supports_v3_rendezvous_point =
-      protocol_list_supports_protocol(protocols, PRT_HSREND,
-                                      PROTOVER_HS_RENDEZVOUS_POINT_V3);
+  if (protocols && strcmp(protocols, "")) {
+    memoize_protover_summary(out, protocols);
   }
-  if (version && !strcmpstart(version, "Tor ")) {
+  if (version && strcmp(version, "") && !strcmpstart(version, "Tor ")) {
     if (!out->protocols_known) {
       /* The version is a "Tor" version, and where there is no
        * list of protocol versions that we should be looking at instead. */
@@ -419,4 +522,14 @@ summarize_protover_flags(protover_summary_flags_t *out,
       }
     }
   }
+}
+
+/**
+ * Free all space held in the protover_summary_map.
+ */
+void
+protover_summary_cache_free_all(void)
+{
+  strmap_free(protover_summary_map, tor_free_);
+  protover_summary_map = NULL;
 }

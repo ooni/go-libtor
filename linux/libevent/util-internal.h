@@ -309,7 +309,7 @@ int evutil_check_working_afunix_();
 #endif
 
 EVENT2_EXPORT_SYMBOL
-int evutil_ersatz_socketpair_(int, int , int, evutil_socket_t[]);
+int evutil_ersatz_socketpair_(int, int , int, evutil_socket_t[2]);
 
 int evutil_resolve_(int family, const char *hostname, struct sockaddr *sa,
     ev_socklen_t *socklen, int port);
@@ -461,8 +461,14 @@ EVENT2_EXPORT_SYMBOL
 HMODULE evutil_load_windows_system_library_(const TCHAR *library_name);
 #endif
 
-#ifndef EV_SIZE_FMT
 #if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__)
+#define EV_WINDOWS 1
+#else
+#define EV_WINDOWS 0
+#endif
+
+#ifndef EV_SIZE_FMT
+#if EV_WINDOWS
 #define EV_U64_FMT "%I64u"
 #define EV_I64_FMT "%I64d"
 #define EV_I64_ARG(x) ((__int64)(x))

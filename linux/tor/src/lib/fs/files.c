@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -245,6 +245,22 @@ file_status(const char *fname)
   } else {
     return FN_ERROR;
   }
+}
+
+/** Returns true if <b>file_type</b> represents an existing file (even if
+ * empty). Returns false otherwise. */
+bool
+is_file(file_status_t file_type)
+{
+  return file_type != FN_ERROR && file_type != FN_NOENT && file_type != FN_DIR;
+}
+
+/** Returns true if <b>file_type</b> represents an existing directory. Returns
+ * false otherwise. */
+bool
+is_dir(file_status_t file_type)
+{
+  return file_type == FN_DIR;
 }
 
 /** Create a file named <b>fname</b> with the contents <b>str</b>.  Overwrite
@@ -716,6 +732,26 @@ read_file_to_str, (const char *filename, int flags, struct stat *stat_out))
   }
 
   return string;
+}
+
+/** Attempt to read a file <b>fname</b>. If the file's contents is
+ * equal to the string <b>str</b>, return 0. Otherwise, attempt to
+ * overwrite the file with the contents of <b>str</b> and return
+ * the value of write_str_to_file().
+ */
+int
+write_str_to_file_if_not_equal(const char *fname, const char *str)
+{
+  char *fstr = read_file_to_str(fname, RFTS_IGNORE_MISSING, NULL);
+  int rv;
+
+  if (!fstr || strcmp(str, fstr)) {
+    rv = write_str_to_file(fname, str, 0);
+  } else {
+    rv = 0;
+  }
+  tor_free(fstr);
+  return rv;
 }
 
 #if !defined(HAVE_GETDELIM) || defined(TOR_UNIT_TESTS)

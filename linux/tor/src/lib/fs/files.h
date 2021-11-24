@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -27,7 +27,7 @@
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
 #endif
-#endif
+#endif /* defined(_WIN32) */
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -55,6 +55,8 @@ MOCK_DECL(int,tor_unlink,(const char *pathname));
 typedef enum { FN_ERROR, FN_NOENT, FN_FILE, FN_DIR, FN_EMPTY } file_status_t;
 
 file_status_t file_status(const char *filename);
+bool is_file(file_status_t file_type);
+bool is_dir(file_status_t file_type);
 
 int64_t tor_get_avail_disk_space(const char *path);
 
@@ -91,6 +93,8 @@ int append_bytes_to_file(const char *fname, const char *str, size_t len,
 int write_bytes_to_new_file(const char *fname, const char *str, size_t len,
                             int bin);
 
+int write_str_to_file_if_not_equal(const char *fname, const char *str);
+
 /** Flag for read_file_to_str: open the file in binary mode. */
 #define RFTS_BIN            1
 /** Flag for read_file_to_str: it's okay if the file doesn't exist. */
@@ -108,7 +112,7 @@ char *read_file_to_str_until_eof(int fd, size_t max_bytes_to_read,
  * Tor is built for unit tests, or when Tor is built on an operating system
  * without its own getdelim(). */
 ssize_t compat_getdelim_(char **lineptr, size_t *n, int delim, FILE *stream);
-#endif
+#endif /* !defined(HAVE_GETDELIM) || defined(TOR_UNIT_TESTS) */
 
 #ifdef HAVE_GETDELIM
 /**
@@ -123,10 +127,10 @@ ssize_t compat_getdelim_(char **lineptr, size_t *n, int delim, FILE *stream);
  */
 #define tor_getdelim(lineptr, n, delim, stream) \
   getdelim((lineptr), (n), (delim), (stream))
-#else
+#else /* !defined(HAVE_GETDELIM) */
 #define tor_getdelim(lineptr, n, delim, stream) \
   compat_getdelim_((lineptr), (n), (delim), (stream))
-#endif
+#endif /* defined(HAVE_GETDELIM) */
 
 #ifdef HAVE_GETLINE
 /**
@@ -137,9 +141,9 @@ ssize_t compat_getdelim_(char **lineptr, size_t *n, int delim, FILE *stream);
  */
 #define tor_getline(lineptr, n, stream) \
   getline((lineptr), (n), (stream))
-#else
+#else /* !defined(HAVE_GETLINE) */
 #define tor_getline(lineptr, n, stream) \
   tor_getdelim((lineptr), (n), '\n', (stream))
-#endif
+#endif /* defined(HAVE_GETLINE) */
 
-#endif
+#endif /* !defined(TOR_FS_H) */

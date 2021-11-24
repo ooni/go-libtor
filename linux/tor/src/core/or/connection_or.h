@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -16,41 +16,13 @@ struct ed25519_public_key_t;
 struct ed25519_keypair_t;
 
 or_connection_t *TO_OR_CONN(connection_t *);
+const or_connection_t *CONST_TO_OR_CONN(const connection_t *);
 
-#define OR_CONN_STATE_MIN_ 1
-/** State for a connection to an OR: waiting for connect() to finish. */
-#define OR_CONN_STATE_CONNECTING 1
-/** State for a connection to an OR: waiting for proxy handshake to complete */
-#define OR_CONN_STATE_PROXY_HANDSHAKING 2
-/** State for an OR connection client: SSL is handshaking, not done
- * yet. */
-#define OR_CONN_STATE_TLS_HANDSHAKING 3
-/** State for a connection to an OR: We're doing a second SSL handshake for
- * renegotiation purposes. (V2 handshake only.) */
-#define OR_CONN_STATE_TLS_CLIENT_RENEGOTIATING 4
-/** State for a connection at an OR: We're waiting for the client to
- * renegotiate (to indicate a v2 handshake) or send a versions cell (to
- * indicate a v3 handshake) */
-#define OR_CONN_STATE_TLS_SERVER_RENEGOTIATING 5
-/** State for an OR connection: We're done with our SSL handshake, we've done
- * renegotiation, but we haven't yet negotiated link protocol versions and
- * sent a netinfo cell. */
-#define OR_CONN_STATE_OR_HANDSHAKING_V2 6
-/** State for an OR connection: We're done with our SSL handshake, but we
- * haven't yet negotiated link protocol versions, done a V3 handshake, and
- * sent a netinfo cell. */
-#define OR_CONN_STATE_OR_HANDSHAKING_V3 7
-/** State for an OR connection: Ready to send/receive cells. */
-#define OR_CONN_STATE_OPEN 8
-#define OR_CONN_STATE_MAX_ 8
+#include "core/or/orconn_event.h"
 
 void connection_or_clear_identity(or_connection_t *conn);
 void connection_or_clear_identity_map(void);
 void clear_broken_connection_map(int disable);
-or_connection_t *connection_or_get_for_extend(const char *digest,
-                                              const tor_addr_t *target_addr,
-                                              const char **msg_out,
-                                              int *launch_out);
 
 void connection_or_block_renegotiation(or_connection_t *conn);
 int connection_or_reached_eof(or_connection_t *conn);
@@ -81,6 +53,9 @@ MOCK_DECL(void,connection_or_close_for_error,
 
 void connection_or_report_broken_states(int severity, int domain);
 
+void connection_or_event_status(or_connection_t *conn,
+                                or_conn_status_event_t tp, int reason);
+
 MOCK_DECL(int,connection_tls_start_handshake,(or_connection_t *conn,
                                               int receiving));
 int connection_tls_continue_handshake(or_connection_t *conn);
@@ -98,6 +73,8 @@ void connection_or_init_conn_from_address(or_connection_t *conn,
 int connection_or_client_learned_peer_id(or_connection_t *conn,
                               const uint8_t *rsa_peer_id,
                               const struct ed25519_public_key_t *ed_peer_id);
+const struct ed25519_public_key_t *connection_or_get_alleged_ed25519_id(
+                              const or_connection_t *conn);
 time_t connection_or_client_used(or_connection_t *conn);
 MOCK_DECL(int, connection_or_get_num_circuits, (or_connection_t *conn));
 void or_handshake_state_free_(or_handshake_state_t *state);
@@ -119,19 +96,6 @@ MOCK_DECL(void,connection_or_write_var_cell_to_buf,(const var_cell_t *cell,
                                                    or_connection_t *conn));
 int connection_or_send_versions(or_connection_t *conn, int v3_plus);
 MOCK_DECL(int,connection_or_send_netinfo,(or_connection_t *conn));
-int connection_or_send_certs_cell(or_connection_t *conn);
-int connection_or_send_auth_challenge_cell(or_connection_t *conn);
-int authchallenge_type_is_supported(uint16_t challenge_type);
-int authchallenge_type_is_better(uint16_t challenge_type_a,
-                                 uint16_t challenge_type_b);
-var_cell_t *connection_or_compute_authenticate_cell_body(
-                              or_connection_t *conn,
-                              const int authtype,
-                              crypto_pk_t *signing_key,
-                              const struct ed25519_keypair_t *ed_signing_key,
-                              int server);
-MOCK_DECL(int,connection_or_send_authenticate_cell,
-          (or_connection_t *conn, int type));
 
 int is_or_protocol_version_known(uint16_t version);
 
@@ -156,10 +120,16 @@ void connection_or_group_set_badness_(smartlist_t *group, int force);
 #ifdef CONNECTION_OR_PRIVATE
 STATIC int should_connect_to_relay(const or_connection_t *or_conn);
 STATIC void note_or_connect_failed(const or_connection_t *or_conn);
-#endif
+#endif /* defined(CONNECTION_OR_PRIVATE) */
+
+/*
+ * Call this when changing connection state, so notifications to the owning
+ * channel can be handled.
+ */
+MOCK_DECL(void, connection_or_change_state,
+          (or_connection_t *conn, uint8_t state));
 
 #ifdef TOR_UNIT_TESTS
-extern int certs_cell_ed25519_disabled_for_testing;
 extern int testing__connection_or_pretend_TLSSECRET_is_supported;
 #endif
 
