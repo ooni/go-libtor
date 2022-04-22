@@ -193,6 +193,25 @@ Explaining how to load an `.aar` into an Android project is beyond the scope of
 
 That's actually it! We've managed to get a Tor hidden service running from an Android phone and access it from another device through the Tor network, all through 40 lines of Go- and 3 lines of Java code.
 
+## Updating libraries
+
+To perform a manual update of the libraries, you should run from the root of
+the repo the following (this assumes you are on macOS system):
+```
+./build/local-linux-build.sh
+./build/darwin.sh
+```
+
+If something breaks or doesn't work as expected, you might have to update the
+configuration headers for the library you are building.
+These are found inside of:
+* `tor_config/orconfig.*.h`
+* `openssl_config/buildinf.*.h`
+* `libevent_config/event2/event-config.*.h`
+
+To aid the process of re-generating these headers, you can use the
+[cross-build-tor repo](https://github.com/ooni/cross-build-tor).
+
 ## Credits
 
 This repository is a fork of [ipsn/go-libtor](https://github.com/ipsn/go-libtor) originaly maintained by Péter Szilágyi ([@karalabe](https://github.com/karalabe)), but authorship of all code contained inside belongs to the individual upstream projects.
