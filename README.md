@@ -6,10 +6,10 @@ The `go-libtor` project is a self-contained, fully statically linked Tor library
 
 | Library  | Version | Commit |
 |:-:|:-:|:-:|
-| zlib | 1.2.11 | [`cacf7f1d4e3d44d871b605da3b647f07d718623f`](https://github.com/madler/zlib/commit/cacf7f1d4e3d44d871b605da3b647f07d718623f) |
-| libevent | 2.2.0-alpha-dev | [`0c217f4fe1af6efdb99321401da6f4048398065f`](https://github.com/libevent/libevent/commit/0c217f4fe1af6efdb99321401da6f4048398065f) |
-| openssl | 1.1.1-stable | [`79ef18759a4f89af0b1e015766a73fa289095673`](https://github.com/openssl/openssl/commit/79ef18759a4f89af0b1e015766a73fa289095673) |
-| tor | 0.4.6.8-dev | [`d06bcf7672d20b0d655a8de7c176630f870cf595`](https://gitweb.torproject.org/tor.git/commit/?id=d06bcf7672d20b0d655a8de7c176630f870cf595) |
+| zlib | 1.2.12 | [`21767c654d31d2dccdde4330529775c6c5fd5389`](https://github.com/madler/zlib/commit/21767c654d31d2dccdde4330529775c6c5fd5389) |
+| libevent | 2.2.0-alpha-dev | [`21e2862689edc59b6265998c4a1a2729552ab0b1`](https://github.com/libevent/libevent/commit/21e2862689edc59b6265998c4a1a2729552ab0b1) |
+| openssl | 1.1.1-stable | [`564a8d442cbd8ce68d452ff2e8a58c0aea6b0632`](https://github.com/openssl/openssl/commit/564a8d442cbd8ce68d452ff2e8a58c0aea6b0632) |
+| tor | 0.4.6.10-dev | [`18cc67f1614a3819b55883a421710a59a66c27a5`](https://gitweb.torproject.org/tor.git/commit/?id=18cc67f1614a3819b55883a421710a59a66c27a5) |
 
 The library is currently supported on:
 
@@ -192,25 +192,6 @@ Explaining how to load an `.aar` into an Android project is beyond the scope of
 ![Android](https://raw.githubusercontent.com/ooni/go-libtor/master/demo.jpg)
 
 That's actually it! We've managed to get a Tor hidden service running from an Android phone and access it from another device through the Tor network, all through 40 lines of Go- and 3 lines of Java code.
-
-## Updating libraries
-
-To perform a manual update of the libraries, you should run from the root of
-the repo the following (this assumes you are on macOS system):
-```
-./build/local-linux-build.sh
-./build/darwin.sh
-```
-
-If something breaks or doesn't work as expected, you might have to update the
-configuration headers for the library you are building.
-These are found inside of:
-* `tor_config/orconfig.*.h`
-* `openssl_config/buildinf.*.h`
-* `libevent_config/event2/event-config.*.h`
-
-To aid the process of re-generating these headers, you can use the
-[cross-build-tor repo](https://github.com/ooni/cross-build-tor).
 
 ## Credits
 
