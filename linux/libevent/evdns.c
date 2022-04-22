@@ -1592,12 +1592,14 @@ request_parse(u8 *packet, int length, struct evdns_server_port *port,
 
 	return 0;
 err:
-	if (server_req->base.questions) {
-		for (i = 0; i < server_req->base.nquestions; ++i)
-			mm_free(server_req->base.questions[i]);
-		mm_free(server_req->base.questions);
+	if (server_req) {
+		if (server_req->base.questions) {
+			for (i = 0; i < server_req->base.nquestions; ++i)
+				mm_free(server_req->base.questions[i]);
+			mm_free(server_req->base.questions);
+		}
+		mm_free(server_req);
 	}
-	mm_free(server_req);
 	return -1;
 
 #undef SKIP_RR
@@ -3432,6 +3434,27 @@ done:
 	EVDNS_UNLOCK(base);
 	return result;
 }
+
+int
+evdns_base_get_nameserver_fd(struct evdns_base *base, int idx)
+{
+	int result = -1;
+	int i;
+	struct nameserver *server;
+	EVDNS_LOCK(base);
+	server = base->server_head;
+	for (i = 0; i < idx && server; ++i, server = server->next) {
+		if (server->next == base->server_head)
+			goto done;
+	}
+	if (! server)
+		goto done;
+	result = server->socket;
+done:
+	EVDNS_UNLOCK(base);
+	return result;
+}
+
 
 /* remove from the queue */
 static void

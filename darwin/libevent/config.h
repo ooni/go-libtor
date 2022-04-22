@@ -195,14 +195,14 @@
 /* Define to 1 if you have the <port.h> header file. */
 /* #undef HAVE_PORT_H */
 
-/* Define if you have POSIX threads libraries and header files. */
-/* #undef HAVE_PTHREAD */
-
 /* Define if we have pthreads on this system */
 #define HAVE_PTHREADS 1
 
 /* Define to 1 if you have the `pthread_mutexattr_setprotocol' function. */
 #define HAVE_PTHREAD_MUTEXATTR_SETPROTOCOL 1
+
+/* Have PTHREAD_PRIO_INHERIT. */
+#define HAVE_PTHREAD_PRIO_INHERIT 1
 
 /* Define to 1 if you have the `putenv' function. */
 #define HAVE_PUTENV 1

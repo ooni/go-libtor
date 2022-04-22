@@ -1,4 +1,5 @@
 #!/bin/bash
+set -ex
 # This script should be run from the root of the repo to locally update the
 # linux/android golang wrappers for the libraries
 
