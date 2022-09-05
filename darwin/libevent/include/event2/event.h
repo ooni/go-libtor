@@ -396,7 +396,7 @@ const char *event_base_get_method(const struct event_base *eb);
 EVENT2_EXPORT_SYMBOL
 const char **event_get_supported_methods(void);
 
-/** Query the current monotonic time from a the timer for a struct
+/** Query the current monotonic time from the timer for a struct
  * event_base.
  */
 EVENT2_EXPORT_SYMBOL
@@ -542,6 +542,8 @@ enum event_base_config_flag {
 	    If this flag is set then bufferevent_socket_new() and
 	    evconn_listener_new() will use IOCP-backed implementations
 	    instead of the usual select-based one on Windows.
+
+	    Note: it is experimental feature, and has some bugs.
 	 */
 	EVENT_BASE_FLAG_STARTUP_IOCP = 0x04,
 	/** Instead of checking the current time every time the event loop is
