@@ -156,6 +156,9 @@
 /* Define to 1 if you have the `mmap' function. */
 #define HAVE_MMAP 1
 
+/* Define to 1 if you have the `mmap64' function. */
+/* #undef HAVE_MMAP64 */
+
 /* Define to 1 if you have the `nanosleep' function. */
 #define HAVE_NANOSLEEP 1
 
