@@ -122,15 +122,16 @@ func main() {
 			"torHash":      torHash,
 		})
 		ioutil.WriteFile("README.md", buf.Bytes(), 0644)
-		buff, err := json.Marshal(lockJson{
+		buff, err := json.MarshalIndent(lockJson{
 			Zlib:     zlibHash,
 			Libevent: libeventHash,
 			Openssl:  opensslHash,
 			Tor:      torHash,
-		})
+		}, "", "  ")
 		if err != nil {
 			panic(err)
 		}
+		buff = append(buff, '\n')
 		ioutil.WriteFile("lock.json", buff, 0644)
 	}
 }
