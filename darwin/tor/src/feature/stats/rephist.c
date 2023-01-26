@@ -69,6 +69,7 @@
 #define REPHIST_PRIVATE
 #include "core/or/or.h"
 #include "app/config/config.h"
+#include "core/mainloop/connection.h"
 #include "core/or/circuitlist.h"
 #include "core/or/connection_or.h"
 #include "feature/dirauth/authmode.h"
@@ -206,17 +207,32 @@ typedef struct {
   uint64_t overload_fd_exhausted;
 } overload_stats_t;
 
+/** Current state of overload stats */
+static overload_stats_t overload_stats;
+
+/** Counters to count the number of times we've reached an overload for the
+ * global connection read/write limit. Reported on the MetricsPort. */
+static uint64_t stats_n_read_limit_reached = 0;
+static uint64_t stats_n_write_limit_reached = 0;
+
+/** Total number of times we've reached TCP port exhaustion. */
+static uint64_t stats_n_tcp_exhaustion = 0;
+
 /***** DNS statistics *****/
 
-/** Represents the statistics of DNS queries seen if it is an Exit. */
+/** Overload DNS statistics. The information in this object is used to assess
+ * if, due to DNS errors, we should emit a general overload signal or not.
+ *
+ * NOTE: This structure is _not_ per DNS query type like the statistics below
+ * because of a libevent bug
+ * (https://github.com/libevent/libevent/issues/1219), on error, the type is
+ * not propagated up back to the user and so we need to keep our own stats for
+ * the overload signal. */
 typedef struct {
   /** Total number of DNS request seen at an Exit. They might not all end
    * successfully or might even be lost by tor. This counter is incremented
    * right before the DNS request is initiated. */
   uint64_t stats_n_request;
-
-  /** Total number of DNS timeout errors. */
-  uint64_t stats_n_error_timeout;
 
   /** When is the next assessment time of the general overload for DNS errors.
    * Once this time is reached, all stats are reset and this time is set to the
@@ -227,35 +243,201 @@ typedef struct {
 /** Keep track of the DNS requests for the general overload state. */
 static overload_dns_stats_t overload_dns_stats;
 
-/* We use a scale here so we can represent percentages with decimal points by
- * scaling the value by this factor and so 0.5% becomes a value of 500.
- * Default is 1% and thus min and max range is 0 to 100%. */
-#define OVERLOAD_DNS_TIMEOUT_PERCENT_SCALE 1000.0
-#define OVERLOAD_DNS_TIMEOUT_PERCENT_DEFAULT 1000
-#define OVERLOAD_DNS_TIMEOUT_PERCENT_MIN 0
-#define OVERLOAD_DNS_TIMEOUT_PERCENT_MAX 100000
+/** Represents the statistics of DNS queries seen if it is an Exit. */
+typedef struct {
+  /* Total number of DNS errors found in RFC 1035 (from 0 to 5 code). */
+  uint64_t stats_n_error_none;          /* 0 */
+  uint64_t stats_n_error_format;        /* 1 */
+  uint64_t stats_n_error_serverfailed;  /* 2 */
+  uint64_t stats_n_error_notexist;      /* 3 */
+  uint64_t stats_n_error_notimpl;       /* 4 */
+  uint64_t stats_n_error_refused;       /* 5 */
 
-/** Consensus parameter: indicate what fraction of DNS timeout errors over the
- * total number of DNS requests must be reached before we trigger a general
- * overload signal .*/
-static double overload_dns_timeout_fraction =
-   OVERLOAD_DNS_TIMEOUT_PERCENT_DEFAULT /
-   OVERLOAD_DNS_TIMEOUT_PERCENT_SCALE / 100.0;
+  /* Total number of DNS errors specific to libevent. */
+  uint64_t stats_n_error_truncated; /* 65 */
+  uint64_t stats_n_error_unknown;   /* 66 */
+  uint64_t stats_n_error_tor_timeout;   /* 67 */
+  uint64_t stats_n_error_shutdown;  /* 68 */
+  uint64_t stats_n_error_cancel;    /* 69 */
+  uint64_t stats_n_error_nodata;    /* 70 */
 
-/* Number of seconds for the assessment period. Default is 10 minutes (600) and
- * the min max range is within a 32bit value. */
-#define OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_DEFAULT (10 * 60)
-#define OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_MIN 0
-#define OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_MAX INT32_MAX
+  /* Total number of DNS request seen at an Exit. They might not all end
+   * successfully or might even be lost by tor. This counter is incremented
+   * right before the DNS request is initiated. */
+  uint64_t stats_n_request;
+} dns_stats_t;
 
-/** Consensus parameter: Period, in seconds, over which we count the number of
- * DNS requests and timeout errors. After that period, we assess if we trigger
- * an overload or not. */
-static int32_t overload_dns_timeout_period_secs =
-  OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_DEFAULT;
+/* This is disabled because of the libevent bug where on error we don't get the
+ * DNS query type back. Once it is fixed, we can re-enable this. */
+#if 0
+/** DNS statistics store for each DNS record type for which tor supports only
+ * three at the moment: A, PTR and AAAA. */
+static dns_stats_t dns_A_stats;
+static dns_stats_t dns_PTR_stats;
+static dns_stats_t dns_AAAA_stats;
+#endif
 
-/** Current state of overload stats */
-static overload_stats_t overload_stats;
+/** DNS query statistics store. It covers all type of queries. */
+static dns_stats_t dns_all_stats;
+
+/** Return the point to the DNS statistics store. Ignore the type for now
+ * because of a libevent problem. */
+static inline dns_stats_t *
+get_dns_stats_by_type(const int type)
+{
+  (void) type;
+  return &dns_all_stats;
+}
+
+#if 0
+/** From a libevent record type, return a pointer to the corresponding DNS
+ * statistics store. NULL is returned if the type is unhandled. */
+static inline dns_stats_t *
+get_dns_stats_by_type(const int type)
+{
+  switch (type) {
+  case DNS_IPv4_A:
+    return &dns_A_stats;
+  case DNS_PTR:
+    return &dns_PTR_stats;
+  case DNS_IPv6_AAAA:
+    return &dns_AAAA_stats;
+  default:
+    return NULL;
+  }
+}
+#endif
+
+/** Return the DNS error count for the given libevent DNS type and error code.
+ * The possible types are: DNS_IPv4_A, DNS_PTR, DNS_IPv6_AAAA. */
+uint64_t
+rep_hist_get_n_dns_error(int type, uint8_t error)
+{
+  dns_stats_t *dns_stats = get_dns_stats_by_type(type);
+  if (BUG(!dns_stats)) {
+    return 0;
+  }
+
+  switch (error) {
+  case DNS_ERR_NONE:
+    return dns_stats->stats_n_error_none;
+  case DNS_ERR_FORMAT:
+    return dns_stats->stats_n_error_format;
+  case DNS_ERR_SERVERFAILED:
+    return dns_stats->stats_n_error_serverfailed;
+  case DNS_ERR_NOTEXIST:
+    return dns_stats->stats_n_error_notexist;
+  case DNS_ERR_NOTIMPL:
+    return dns_stats->stats_n_error_notimpl;
+  case DNS_ERR_REFUSED:
+    return dns_stats->stats_n_error_refused;
+  case DNS_ERR_TRUNCATED:
+    return dns_stats->stats_n_error_truncated;
+  case DNS_ERR_UNKNOWN:
+    return dns_stats->stats_n_error_unknown;
+  case DNS_ERR_TIMEOUT:
+    return dns_stats->stats_n_error_tor_timeout;
+  case DNS_ERR_SHUTDOWN:
+    return dns_stats->stats_n_error_shutdown;
+  case DNS_ERR_CANCEL:
+    return dns_stats->stats_n_error_cancel;
+  case DNS_ERR_NODATA:
+    return dns_stats->stats_n_error_nodata;
+  default:
+    /* Unhandled code sent back by libevent. */
+    return 0;
+  }
+}
+
+/** Return the total number of DNS request seen for the given libevent DNS
+ * record type. Possible types are: DNS_IPv4_A, DNS_PTR, DNS_IPv6_AAAA. */
+uint64_t
+rep_hist_get_n_dns_request(int type)
+{
+  dns_stats_t *dns_stats = get_dns_stats_by_type(type);
+  if (BUG(!dns_stats)) {
+    return 0;
+  }
+  return dns_stats->stats_n_request;
+}
+
+/** Note a DNS error for the given given libevent DNS record type and error
+ * code. Possible types are: DNS_IPv4_A, DNS_PTR, DNS_IPv6_AAAA.
+ *
+ * NOTE: Libevent is _not_ returning the type in case of an error and so if
+ * error is anything but DNS_ERR_NONE, the type is not usable and set to 0.
+ *
+ * See: https://gitlab.torproject.org/tpo/core/tor/-/issues/40490 */
+void
+rep_hist_note_dns_error(int type, uint8_t error)
+{
+  overload_dns_stats.stats_n_request++;
+
+  /* Again, the libevent bug (see function comment), for an error that is
+   * anything but DNS_ERR_NONE, the type is always 0 which means that we don't
+   * have a DNS stat object for it so this code will do nothing until libevent
+   * is fixed. */
+  dns_stats_t *dns_stats = get_dns_stats_by_type(type);
+  /* Unsupported DNS query type. */
+  if (!dns_stats) {
+    return;
+  }
+
+  switch (error) {
+  case DNS_ERR_NONE:
+    dns_stats->stats_n_error_none++;
+    break;
+  case DNS_ERR_FORMAT:
+    dns_stats->stats_n_error_format++;
+    break;
+  case DNS_ERR_SERVERFAILED:
+    dns_stats->stats_n_error_serverfailed++;
+    break;
+  case DNS_ERR_NOTEXIST:
+    dns_stats->stats_n_error_notexist++;
+    break;
+  case DNS_ERR_NOTIMPL:
+    dns_stats->stats_n_error_notimpl++;
+    break;
+  case DNS_ERR_REFUSED:
+    dns_stats->stats_n_error_refused++;
+    break;
+  case DNS_ERR_TRUNCATED:
+    dns_stats->stats_n_error_truncated++;
+    break;
+  case DNS_ERR_UNKNOWN:
+    dns_stats->stats_n_error_unknown++;
+    break;
+  case DNS_ERR_TIMEOUT:
+    dns_stats->stats_n_error_tor_timeout++;
+    break;
+  case DNS_ERR_SHUTDOWN:
+    dns_stats->stats_n_error_shutdown++;
+    break;
+  case DNS_ERR_CANCEL:
+    dns_stats->stats_n_error_cancel++;
+    break;
+  case DNS_ERR_NODATA:
+    dns_stats->stats_n_error_nodata++;
+    break;
+  default:
+    /* Unhandled code sent back by libevent. */
+    break;
+  }
+}
+
+/** Note a DNS request for the given given libevent DNS record type. */
+void
+rep_hist_note_dns_request(int type)
+{
+  dns_stats_t *dns_stats = get_dns_stats_by_type(type);
+  if (BUG(!dns_stats)) {
+    return;
+  }
+  dns_stats->stats_n_request++;
+}
+
+/***** END of DNS statistics *****/
 
 /** Return true if this overload happened within the last `n_hours`. */
 static bool
@@ -268,60 +450,22 @@ overload_happened_recently(time_t overload_time, int n_hours)
   return false;
 }
 
-/** Assess the DNS timeout errors and if we have enough to trigger a general
- * overload. */
-static void
-overload_general_dns_assessment(void)
-{
-  /* Initialize the time. Should be done once. */
-  if (overload_dns_stats.next_assessment_time == 0) {
-    goto reset;
-  }
-
-  /* Not the time yet. */
-  if (overload_dns_stats.next_assessment_time > approx_time()) {
-    return;
-  }
-
- reset:
-  /* Reset counters for the next period. */
-  overload_dns_stats.stats_n_error_timeout = 0;
-  overload_dns_stats.stats_n_request = 0;
-  overload_dns_stats.next_assessment_time =
-    approx_time() + overload_dns_timeout_period_secs;
-}
-
-/** Note a DNS error for the given given libevent DNS record type and error
- * code. Possible types are: DNS_IPv4_A, DNS_PTR, DNS_IPv6_AAAA.
- *
- * IMPORTANT: Libevent is _not_ returning the type in case of an error and so
- * if error is anything but DNS_ERR_NONE, the type is not usable and set to 0.
- *
- * See: https://gitlab.torproject.org/tpo/core/tor/-/issues/40490 */
-void
-rep_hist_note_dns_query(int type, uint8_t error)
-{
-  (void) type;
-
-  /* Assess if we need to trigger a general overload with regards to the DNS
-   * errors or not. */
-  overload_general_dns_assessment();
-
-  /* We only care about timeouts for the moment. */
-  switch (error) {
-  case DNS_ERR_TIMEOUT:
-    overload_dns_stats.stats_n_error_timeout++;
-    break;
-  default:
-    break;
-  }
-
-  /* Increment total number of requests. */
-  overload_dns_stats.stats_n_request++;
-}
-
 /* The current version of the overload stats version */
 #define OVERLOAD_STATS_VERSION 1
+
+/** Return the stats_n_read_limit_reached counter. */
+uint64_t
+rep_hist_get_n_read_limit_reached(void)
+{
+  return stats_n_read_limit_reached;
+}
+
+/** Return the stats_n_write_limit_reached counter. */
+uint64_t
+rep_hist_get_n_write_limit_reached(void)
+{
+  return stats_n_write_limit_reached;
+}
 
 /** Returns an allocated string for server descriptor for publising information
  * on whether we are overloaded or not. */
@@ -401,6 +545,7 @@ rep_hist_note_overload(overload_type_t overload)
     SET_TO_START_OF_HOUR(overload_stats.overload_general_time);
     break;
   case OVERLOAD_READ: {
+    stats_n_read_limit_reached++;
     SET_TO_START_OF_HOUR(overload_stats.overload_ratelimits_time);
     if (approx_time() >= last_read_counted + 60) { /* Count once a minute */
         overload_stats.overload_read_count++;
@@ -409,6 +554,7 @@ rep_hist_note_overload(overload_type_t overload)
     break;
   }
   case OVERLOAD_WRITE: {
+    stats_n_write_limit_reached++;
     SET_TO_START_OF_HOUR(overload_stats.overload_ratelimits_time);
     if (approx_time() >= last_write_counted + 60) { /* Count once a minute */
       overload_stats.overload_write_count++;
@@ -421,6 +567,22 @@ rep_hist_note_overload(overload_type_t overload)
     overload_stats.overload_fd_exhausted++;
     break;
   }
+}
+
+/** Note down that we've reached a TCP port exhaustion. This triggers an
+ * overload general event. */
+void
+rep_hist_note_tcp_exhaustion(void)
+{
+  stats_n_tcp_exhaustion++;
+  rep_hist_note_overload(OVERLOAD_GENERAL);
+}
+
+/** Return the total number of TCP exhaustion times we've reached. */
+uint64_t
+rep_hist_get_n_tcp_exhaustion(void)
+{
+  return stats_n_tcp_exhaustion;
 }
 
 /** Return the or_history_t for the OR with identity digest <b>id</b>,
@@ -622,7 +784,7 @@ rep_hist_downrate_old_runs(time_t now)
     return stability_last_downrated + STABILITY_INTERVAL;
 
   /* Okay, we should downrate the data.  By how much? */
-  while (stability_last_downrated + STABILITY_INTERVAL < now) {
+  while (stability_last_downrated + STABILITY_INTERVAL <= now) {
     stability_last_downrated += STABILITY_INTERVAL;
     alpha *= STABILITY_ALPHA;
   }
@@ -1477,6 +1639,183 @@ rep_hist_note_exit_stream_opened(uint16_t port)
   log_debug(LD_HIST, "Opened exit stream to port %d", port);
 }
 
+/*** Exit streams statistics ***/
+
+/** Number of BEGIN streams seen. */
+static uint64_t streams_begin_seen;
+/** Number of BEGIN_DIR streams seen. */
+static uint64_t streams_begindir_seen;
+/** Number of RESOLVE streams seen. */
+static uint64_t streams_resolve_seen;
+
+/** Note a stream as seen for the given relay command. */
+void
+rep_hist_note_exit_stream(unsigned int cmd)
+{
+  switch (cmd) {
+  case RELAY_COMMAND_BEGIN:
+    streams_begin_seen++;
+    break;
+  case RELAY_COMMAND_BEGIN_DIR:
+    streams_begindir_seen++;
+    break;
+  case RELAY_COMMAND_RESOLVE:
+    streams_resolve_seen++;
+    break;
+  default:
+    tor_assert_nonfatal_unreached_once();
+    break;
+  }
+}
+
+/** Return number of stream seen for the given command. */
+uint64_t
+rep_hist_get_exit_stream_seen(unsigned int cmd)
+{
+  switch (cmd) {
+  case RELAY_COMMAND_BEGIN:
+    return streams_begin_seen;
+  case RELAY_COMMAND_BEGIN_DIR:
+    return streams_begindir_seen;
+  case RELAY_COMMAND_RESOLVE:
+    return streams_resolve_seen;
+  default:
+    return 0;
+  }
+}
+
+/******* Connections statistics *******/
+
+#define CONN_DIRECTION_INITIATED 0
+#define CONN_DIRECTION_RECEIVED  1
+
+#define CONN_DIRECTION(from_listener) \
+  (from_listener) ? CONN_DIRECTION_RECEIVED : CONN_DIRECTION_INITIATED
+
+/** Number of connections created as in seen per direction per type. */
+static uint64_t conn_num_created_v4[2][CONN_TYPE_MAX_];
+static uint64_t conn_num_created_v6[2][CONN_TYPE_MAX_];
+/** Number of connections opened per direction per type. */
+static uint64_t conn_num_opened_v4[2][CONN_TYPE_MAX_];
+static uint64_t conn_num_opened_v6[2][CONN_TYPE_MAX_];
+/** Number of connections rejected per type. Always inbound. */
+static uint64_t conn_num_rejected_v4[CONN_TYPE_MAX_];
+static uint64_t conn_num_rejected_v6[CONN_TYPE_MAX_];
+
+/** Note that a connection has opened of the given type. */
+void
+rep_hist_note_conn_opened(bool from_listener, unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+
+  unsigned int dir = CONN_DIRECTION(from_listener);
+
+  switch (af) {
+  case AF_INET:
+    conn_num_created_v4[dir][type]++;
+    conn_num_opened_v4[dir][type]++;
+    break;
+  case AF_INET6:
+    conn_num_created_v6[dir][type]++;
+    conn_num_opened_v6[dir][type]++;
+    break;
+  default:
+    /* Ignore non IP connections at this point in time. */
+    break;
+  }
+}
+
+/** Note that a connection has closed of the given type. */
+void
+rep_hist_note_conn_closed(bool from_listener, unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+
+  unsigned int dir = CONN_DIRECTION(from_listener);
+
+  switch (af) {
+  case AF_INET:
+    if (conn_num_opened_v4[dir][type] > 0) {
+      conn_num_opened_v4[dir][type]--;
+    }
+    break;
+  case AF_INET6:
+    if (conn_num_opened_v6[dir][type] > 0) {
+      conn_num_opened_v6[dir][type]--;
+    }
+    break;
+  default:
+    /* Ignore non IP connections at this point in time. */
+    break;
+  }
+}
+
+/** Note that a connection has rejected of the given type. */
+void
+rep_hist_note_conn_rejected(unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+
+  switch (af) {
+  case AF_INET:
+    conn_num_rejected_v4[type]++;
+    break;
+  case AF_INET6:
+    conn_num_rejected_v6[type]++;
+    break;
+  default:
+    /* Ignore non IP connections at this point in time. */
+    break;
+  }
+}
+
+/** Return number of created connections of the given type. */
+uint64_t
+rep_hist_get_conn_created(bool from_listener, unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+  unsigned int dir = CONN_DIRECTION(from_listener);
+  switch (af) {
+  case AF_INET:
+    return conn_num_created_v4[dir][type];
+  case AF_INET6:
+    return conn_num_created_v6[dir][type];
+  default:
+    return 0;
+  }
+}
+
+/** Return number of opened connections of the given type. */
+uint64_t
+rep_hist_get_conn_opened(bool from_listener, unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+  unsigned int dir = CONN_DIRECTION(from_listener);
+  switch (af) {
+  case AF_INET:
+    return conn_num_opened_v4[dir][type];
+  case AF_INET6:
+    return conn_num_opened_v6[dir][type];
+  default:
+    return 0;
+  }
+}
+
+/** Return number of opened connections of the given type. */
+uint64_t
+rep_hist_get_conn_rejected(unsigned int type, int af)
+{
+  tor_assert(type <= CONN_TYPE_MAX_);
+  switch (af) {
+  case AF_INET:
+    return conn_num_rejected_v4[type];
+  case AF_INET6:
+    return conn_num_rejected_v6[type];
+  default:
+    return 0;
+  }
+}
+
 /*** cell statistics ***/
 
 /** Start of the current buffer stats interval or 0 if we're not
@@ -1889,9 +2228,11 @@ rep_hist_note_desc_served(const char * desc)
 /** Internal statistics to track how many requests of each type of
  * handshake we've received, and how many we've assigned to cpuworkers.
  * Useful for seeing trends in cpu load.
+ *
+ * They are reset at every heartbeat.
  * @{ */
-STATIC int onion_handshakes_requested[MAX_ONION_HANDSHAKE_TYPE+1] = {0};
-STATIC int onion_handshakes_assigned[MAX_ONION_HANDSHAKE_TYPE+1] = {0};
+STATIC int onion_handshakes_requested[MAX_ONION_STAT_TYPE+1] = {0};
+STATIC int onion_handshakes_assigned[MAX_ONION_STAT_TYPE+1] = {0};
 /**@}*/
 
 /** Counters keeping the same stats as above but for the entire duration of the
@@ -1956,6 +2297,10 @@ static overload_onionskin_assessment_t overload_onionskin_assessment;
 static inline uint16_t
 onionskin_type_to_stat(uint16_t type)
 {
+  if (type == ONION_HANDSHAKE_TYPE_NTOR_V3) {
+    return ONION_HANDSHAKE_TYPE_NTOR;
+  }
+
   if (BUG(type > MAX_ONION_STAT_TYPE)) {
     return MAX_ONION_STAT_TYPE; // use ntor if out of range
   }
@@ -2063,20 +2408,28 @@ rep_hist_note_circuit_handshake_dropped(uint16_t type)
 MOCK_IMPL(int,
 rep_hist_get_circuit_handshake_requested, (uint16_t type))
 {
-  if (BUG(type > MAX_ONION_HANDSHAKE_TYPE)) {
-    return 0;
-  }
-  return onion_handshakes_requested[type];
+  return onion_handshakes_requested[onionskin_type_to_stat(type)];
 }
 
 /** Get the circuit handshake value that is assigned. */
 MOCK_IMPL(int,
 rep_hist_get_circuit_handshake_assigned, (uint16_t type))
 {
-  if (BUG(type > MAX_ONION_HANDSHAKE_TYPE)) {
-    return 0;
-  }
-  return onion_handshakes_assigned[type];
+  return onion_handshakes_assigned[onionskin_type_to_stat(type)];
+}
+
+/** Get the total number of circuit handshake value that is assigned. */
+MOCK_IMPL(uint64_t,
+rep_hist_get_circuit_n_handshake_assigned, (uint16_t type))
+{
+  return stats_n_onionskin_assigned[onionskin_type_to_stat(type)];
+}
+
+/** Get the total number of circuit handshake value that is dropped. */
+MOCK_IMPL(uint64_t,
+rep_hist_get_circuit_n_handshake_dropped, (uint16_t type))
+{
+  return stats_n_onionskin_dropped[onionskin_type_to_stat(type)];
 }
 
 /** Log our onionskin statistics since the last time we were called. */
@@ -2668,20 +3021,6 @@ rep_hist_consensus_has_changed(const networkstatus_t *ns)
                             OVERLOAD_ONIONSKIN_NTOR_PERIOD_SECS_DEFAULT,
                             OVERLOAD_ONIONSKIN_NTOR_PERIOD_SECS_MIN,
                             OVERLOAD_ONIONSKIN_NTOR_PERIOD_SECS_MAX);
-
-  /** XXX: Unused parameters. */
-  overload_dns_timeout_fraction =
-    networkstatus_get_param(ns, "overload_dns_timeout_scale_percent",
-                            OVERLOAD_DNS_TIMEOUT_PERCENT_DEFAULT,
-                            OVERLOAD_DNS_TIMEOUT_PERCENT_MIN,
-                            OVERLOAD_DNS_TIMEOUT_PERCENT_MAX) /
-    OVERLOAD_DNS_TIMEOUT_PERCENT_SCALE / 100.0;
-
-  overload_dns_timeout_period_secs =
-    networkstatus_get_param(ns, "overload_dns_timeout_period_secs",
-                            OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_DEFAULT,
-                            OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_MIN,
-                            OVERLOAD_DNS_TIMEOUT_PERIOD_SECS_MAX);
 }
 
 #ifdef TOR_UNIT_TESTS

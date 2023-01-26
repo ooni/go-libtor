@@ -15,8 +15,13 @@
 extern uint64_t stats_n_relay_cells_relayed;
 extern uint64_t stats_n_relay_cells_delivered;
 extern uint64_t stats_n_circ_max_cell_reached;
+extern uint64_t stats_n_circ_max_cell_outq_reached;
+
+const char *relay_command_to_string(uint8_t command);
 
 void relay_consensus_has_changed(const networkstatus_t *ns);
+uint32_t relay_get_param_max_circuit_cell_queue_size(
+                                     const networkstatus_t *ns);
 int circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
                                cell_direction_t cell_direction);
 size_t cell_queues_get_total_allocation(void);
@@ -48,6 +53,11 @@ extern uint64_t stats_n_data_cells_packaged;
 extern uint64_t stats_n_data_bytes_packaged;
 extern uint64_t stats_n_data_cells_received;
 extern uint64_t stats_n_data_bytes_received;
+
+extern uint64_t oom_stats_n_bytes_removed_dns;
+extern uint64_t oom_stats_n_bytes_removed_cell;
+extern uint64_t oom_stats_n_bytes_removed_geoip;
+extern uint64_t oom_stats_n_bytes_removed_hsdir;
 
 void dump_cell_pool_usage(int severity);
 size_t packed_cell_mem_cost(void);

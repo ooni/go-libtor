@@ -75,8 +75,7 @@
 /* Add platform entropy 32 bytes (256 bits) at a time. */
 #define ADD_ENTROPY 32
 
-/* Re-seed from the platform RNG after generating this many bytes. */
-#define BYTES_BEFORE_RESEED 1600000
+#define REKEY_BASE (1024*1024) /* NB. should be a power of 2 */
 
 struct arc4_stream {
 	unsigned char i;
@@ -343,10 +342,13 @@ arc4_seed(void)
 	return ok ? 0 : -1;
 }
 
+static inline unsigned int
+arc4_getword(void);
 static int
 arc4_stir(void)
 {
 	int     i;
+	ARC4RANDOM_UINT32 rekey_fuzz; 
 
 	if (!rs_initialized) {
 		arc4_init();
@@ -377,7 +379,9 @@ arc4_stir(void)
 	for (i = 0; i < 12*256; i++)
 		(void)arc4_getbyte();
 
-	arc4_count = BYTES_BEFORE_RESEED;
+	rekey_fuzz = arc4_getword();
+	/* rekey interval should not be predictable */
+	arc4_count = REKEY_BASE + (rekey_fuzz % REKEY_BASE);
 
 	return 0;
 }
@@ -414,7 +418,7 @@ arc4_getword(void)
 {
 	unsigned int val;
 
-	val = arc4_getbyte() << 24;
+	val = (unsigned)arc4_getbyte() << 24;
 	val |= arc4_getbyte() << 16;
 	val |= arc4_getbyte() << 8;
 	val |= arc4_getbyte();
@@ -467,6 +471,7 @@ arc4random(void)
 }
 #endif
 
+#ifndef EVENT__HAVE_ARC4RANDOM_BUF
 ARC4RANDOM_EXPORT void
 arc4random_buf(void *buf_, size_t n)
 {
@@ -480,6 +485,7 @@ arc4random_buf(void *buf_, size_t n)
 	}
 	ARC4_UNLOCK_();
 }
+#endif  /* #ifndef EVENT__HAVE_ARC4RANDOM_BUF */
 
 #ifndef ARC4RANDOM_NOUNIFORM
 /*

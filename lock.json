@@ -1,1 +1,6 @@
-{"zlib":"21767c654d31d2dccdde4330529775c6c5fd5389","libevent":"b19af675c7601a7867f26c33072cda7ea125adb2","openssl":"9eae491721209f302a9a475bffd271370e8bcb8f","tor":"e7dddda9c155bc91ef87dc6cb0600f6986e63b52"}
+{
+  "zlib": "04f42ceca40f73e2978b50e93806c2a18c1281fc",
+  "libevent": "c01cb1d685b70bc9ef102e08eba6ea3e928ae59c",
+  "openssl": "44da71693cdad2deb6430a47d3f3ee9f57065091",
+  "tor": "e390a7cdee2dab0abcbaf06fad9d03b028377a70"
+}

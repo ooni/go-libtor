@@ -161,6 +161,11 @@
     ((p) == CIRCUIT_PURPOSE_C_GENERAL || \
      (p) == CIRCUIT_PURPOSE_C_HSDIR_GET)
 
+/** Stats. */
+extern double cc_stats_circ_close_cwnd_ma;
+extern double cc_stats_circ_close_ss_cwnd_ma;
+extern uint64_t cc_stats_circs_closed;
+
 /** Convert a circuit_t* to a pointer to the enclosing or_circuit_t.  Assert
  * if the cast is impossible. */
 or_circuit_t *TO_OR_CIRCUIT(circuit_t *);
@@ -232,7 +237,7 @@ int circuit_count_pending_on_channel(channel_t *chan);
 
 MOCK_DECL(void, assert_circuit_ok,(const circuit_t *c));
 void circuit_free_all(void);
-void circuits_handle_oom(size_t current_allocation);
+size_t circuits_handle_oom(size_t current_allocation);
 
 void circuit_clear_testing_cell_stats(circuit_t *circ);
 

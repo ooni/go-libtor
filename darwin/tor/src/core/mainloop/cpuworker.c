@@ -21,6 +21,8 @@
 #include "core/or/channel.h"
 #include "core/or/circuitlist.h"
 #include "core/or/connection_or.h"
+#include "core/or/congestion_control_common.h"
+#include "core/or/congestion_control_flow.h"
 #include "app/config/config.h"
 #include "core/mainloop/cpuworker.h"
 #include "lib/crypt_ops/crypto_rand.h"
@@ -30,6 +32,7 @@
 #include "feature/relay/onion_queue.h"
 #include "feature/stats/rephist.h"
 #include "feature/relay/router.h"
+#include "feature/nodelist/networkstatus.h"
 #include "lib/evloop/workqueue.h"
 #include "core/crypto/onion_crypto.h"
 
@@ -73,8 +76,42 @@ worker_state_free_void(void *arg)
 static replyqueue_t *replyqueue = NULL;
 static threadpool_t *threadpool = NULL;
 
-static int total_pending_tasks = 0;
-static int max_pending_tasks = 128;
+static uint32_t total_pending_tasks = 0;
+static uint32_t max_pending_tasks = 128;
+
+/** Return the consensus parameter max pending tasks per CPU. */
+static uint32_t
+get_max_pending_tasks_per_cpu(const networkstatus_t *ns)
+{
+/* Total voodoo. Can we make this more sensible? Maybe, that is why we made it
+ * a consensus parameter so our future self can figure out this magic. */
+#define MAX_PENDING_TASKS_PER_CPU_DEFAULT 64
+#define MAX_PENDING_TASKS_PER_CPU_MIN 1
+#define MAX_PENDING_TASKS_PER_CPU_MAX INT32_MAX
+
+  return networkstatus_get_param(ns, "max_pending_tasks_per_cpu",
+                                 MAX_PENDING_TASKS_PER_CPU_DEFAULT,
+                                 MAX_PENDING_TASKS_PER_CPU_MIN,
+                                 MAX_PENDING_TASKS_PER_CPU_MAX);
+}
+
+/** Set the max pending tasks per CPU worker. This uses the consensus to check
+ * for the allowed number per CPU. The ns parameter can be NULL as in that no
+ * consensus is available at the time of setting this value. */
+static void
+set_max_pending_tasks(const networkstatus_t *ns)
+{
+  max_pending_tasks =
+    get_num_cpus(get_options()) * get_max_pending_tasks_per_cpu(ns);
+}
+
+/** Called when the consensus has changed. */
+void
+cpuworker_consensus_has_changed(const networkstatus_t *ns)
+{
+  tor_assert(ns);
+  set_max_pending_tasks(ns);
+}
 
 /** Initialize the cpuworker subsystem. It is OK to call this more than once
  * during Tor's lifetime.
@@ -104,8 +141,17 @@ cpu_init(void)
     tor_assert(r == 0);
   }
 
-  /* Total voodoo. Can we make this more sensible? */
-  max_pending_tasks = get_num_cpus(get_options()) * 64;
+  set_max_pending_tasks(NULL);
+}
+
+/** Return the number of threads configured for our CPU worker. */
+unsigned int
+cpuworker_get_n_threads(void)
+{
+  if (!threadpool) {
+    return 0;
+  }
+  return threadpool_get_n_threads(threadpool);
 }
 
 /** Magic numbers to make sure our cpuworker_requests don't grow any
@@ -125,6 +171,11 @@ typedef struct cpuworker_request_t {
 
   /** A create cell for the cpuworker to process. */
   create_cell_t create_cell;
+
+  /**
+   * A copy of this relay's consensus params that are relevant to
+   * the circuit, for use in negotiation. */
+  circuit_params_t circ_ns_params;
 
   /* Turn the above into a tagged union if needed. */
 } cpuworker_request_t;
@@ -158,6 +209,8 @@ typedef struct cpuworker_reply_t {
   uint8_t keys[CPATH_KEY_MATERIAL_LEN];
   /** Input to use for authenticating introduce1 cells. */
   uint8_t rend_auth_material[DIGEST_LEN];
+  /** Negotiated circuit parameters. */
+  circuit_params_t circ_params;
 } cpuworker_reply_t;
 
 typedef struct cpuworker_job_u_t {
@@ -379,6 +432,18 @@ cpuworker_onion_handshake_replyfn(void *work_)
     goto done_processing;
   }
 
+  /* If the client asked for congestion control, if our consensus parameter
+   * allowed it to negotiate as enabled, allocate a congestion control obj. */
+  if (rpl.circ_params.cc_enabled) {
+    if (get_options()->SbwsExit) {
+      TO_CIRCUIT(circ)->ccontrol = congestion_control_new(&rpl.circ_params,
+                                                          CC_PATH_SBWS);
+    } else {
+      TO_CIRCUIT(circ)->ccontrol = congestion_control_new(&rpl.circ_params,
+                                                          CC_PATH_EXIT);
+    }
+  }
+
   if (onionskin_answer(circ,
                        &rpl.created_cell,
                        (const char*)rpl.keys, sizeof(rpl.keys),
@@ -387,6 +452,7 @@ cpuworker_onion_handshake_replyfn(void *work_)
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
     goto done_processing;
   }
+
   log_debug(LD_OR,"onionskin_answer succeeded. Yay.");
 
  done_processing:
@@ -425,9 +491,12 @@ cpuworker_onion_handshake_threadfn(void *state_, void *work_)
   n = onion_skin_server_handshake(cc->handshake_type,
                                   cc->onionskin, cc->handshake_len,
                                   onion_keys,
+                                  &req.circ_ns_params,
                                   cell_out->reply,
+                                  sizeof(cell_out->reply),
                                   rpl.keys, CPATH_KEY_MATERIAL_LEN,
-                                  rpl.rend_auth_material);
+                                  rpl.rend_auth_material,
+                                  &rpl.circ_params);
   if (n < 0) {
     /* failure */
     log_debug(LD_OR,"onion_skin_server_handshake failed.");
@@ -450,6 +519,7 @@ cpuworker_onion_handshake_threadfn(void *state_, void *work_)
     }
     rpl.success = 1;
   }
+
   rpl.magic = CPUWORKER_REPLY_MAGIC;
   if (req.timed) {
     struct timeval tv_diff;
@@ -549,6 +619,11 @@ assign_onionskin_to_cpuworker(or_circuit_t *circ,
 
   if (should_time)
     tor_gettimeofday(&req.started_at);
+
+  /* Copy the current cached consensus params relevant to
+   * circuit negotiation into the CPU worker context */
+  req.circ_ns_params.cc_enabled = congestion_control_enabled();
+  req.circ_ns_params.sendme_inc_cells = congestion_control_sendme_inc();
 
   job = tor_malloc_zero(sizeof(cpuworker_job_t));
   job->circ = circ;

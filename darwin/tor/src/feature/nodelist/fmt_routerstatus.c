@@ -87,7 +87,7 @@ routerstatus_format_entry(const routerstatus_t *rs, const char *version,
     goto done;
 
   smartlist_add_asprintf(chunks,
-                   "s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+                   "s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                   /* These must stay in alphabetical order. */
                    rs->is_authority?" Authority":"",
                    rs->is_bad_exit?" BadExit":"",
@@ -95,6 +95,7 @@ routerstatus_format_entry(const routerstatus_t *rs, const char *version,
                    rs->is_fast?" Fast":"",
                    rs->is_possible_guard?" Guard":"",
                    rs->is_hs_dir?" HSDir":"",
+                   rs->is_middle_only?" MiddleOnly":"",
                    rs->is_flagged_running?" Running":"",
                    rs->is_stable?" Stable":"",
                    rs->is_staledesc?" StaleDesc":"",
@@ -168,9 +169,20 @@ routerstatus_format_entry(const routerstatus_t *rs, const char *version,
     smartlist_add_asprintf(chunks,
                      "w Bandwidth=%d", bw_kb);
 
+    /* Include the bandwidth weight from our external bandwidth
+     * authority, if we have one. */
     if (format == NS_V3_VOTE && vrs && vrs->has_measured_bw) {
-      smartlist_add_asprintf(chunks,
-                       " Measured=%d", vrs->measured_bw_kb);
+      if (!rs->is_authority) { /* normal case */
+        smartlist_add_asprintf(chunks,
+                         " Measured=%d", vrs->measured_bw_kb);
+      } else {
+       /* dir auth special case: don't give it a Measured line, so we
+        * can reserve its attention for authority-specific activities.
+        * But do include the bwauth's opinion so it can be recorded for
+        * posterity. See #40698 for details. */
+        smartlist_add_asprintf(chunks,
+                         " MeasuredButAuthority=%d", vrs->measured_bw_kb);
+      }
     }
     /* Write down guardfraction information if we have it. */
     if (format == NS_V3_VOTE && vrs && vrs->status.has_guardfraction) {

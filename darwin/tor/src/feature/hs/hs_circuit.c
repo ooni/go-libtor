@@ -17,6 +17,8 @@
 #include "core/or/relay.h"
 #include "core/or/crypt_path.h"
 #include "core/or/extendinfo.h"
+#include "core/or/congestion_control_common.h"
+#include "core/crypto/onion_crypto.h"
 #include "feature/client/circpathbias.h"
 #include "feature/hs/hs_cell.h"
 #include "feature/hs/hs_circuit.h"
@@ -35,9 +37,9 @@
 
 /* Trunnel. */
 #include "trunnel/ed25519_cert.h"
-#include "trunnel/hs/cell_common.h"
 #include "trunnel/hs/cell_establish_intro.h"
 
+#include "core/or/congestion_control_st.h"
 #include "core/or/cpath_build_state_st.h"
 #include "core/or/crypt_path_st.h"
 #include "feature/nodelist/node_st.h"
@@ -124,10 +126,11 @@ finalize_rend_circuit(origin_circuit_t *circ, crypt_path_t *hop,
   hop->package_window = circuit_initial_package_window();
   hop->deliver_window = CIRCWINDOW_START;
 
-  /* Now that this circuit has finished connecting to its destination,
-   * make sure circuit_get_open_circ_or_launch is willing to return it
-   * so we can actually use it. */
-  circ->hs_circ_has_timed_out = 0;
+  /* If congestion control, transfer ccontrol onto the cpath. */
+  if (TO_CIRCUIT(circ)->ccontrol) {
+    hop->ccontrol = TO_CIRCUIT(circ)->ccontrol;
+    TO_CIRCUIT(circ)->ccontrol = NULL;
+  }
 
   /* Append the hop to the cpath of this circuit */
   cpath_extend_linked_list(&circ->cpath, hop);
@@ -408,6 +411,12 @@ launch_rendezvous_point_circuit,(const hs_service_t *service,
     tor_assert(circ->hs_ident);
   }
 
+  /* Setup congestion control if asked by the client from the INTRO cell. */
+  if (data->cc_enabled) {
+    hs_circ_setup_congestion_control(circ, congestion_control_sendme_inc(),
+                                     service->config.is_single_onion);
+  }
+
  end:
   extend_info_free(info);
 }
@@ -423,16 +432,6 @@ can_relaunch_service_rendezvous_point(const origin_circuit_t *circ)
   tor_assert(TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_S_CONNECT_REND);
 
   /* XXX: Retrying under certain condition. This is related to #22455. */
-
-  /* Avoid to relaunch twice a circuit to the same rendezvous point at the
-   * same time. */
-  if (circ->hs_service_side_rend_circ_has_been_relaunched) {
-    log_info(LD_REND, "Rendezvous circuit to %s has already been retried. "
-                      "Skipping retry.",
-             safe_str_client(
-                  extend_info_describe(circ->build_state->chosen_exit)));
-    goto disallow;
-  }
 
   /* We check failure_count >= hs_get_service_max_rend_failures()-1 below, and
    * the -1 is because we increment the failure count for our current failure
@@ -504,6 +503,15 @@ retry_service_rendezvous_point(const origin_circuit_t *circ)
   new_circ->build_state->expiry_time = bstate->expiry_time;
   new_circ->hs_ident = hs_ident_circuit_dup(circ->hs_ident);
 
+  /* Setup congestion control if asked by the client from the INTRO cell. */
+  if (TO_CIRCUIT(circ)->ccontrol) {
+    /* As per above, in this case, we are a full 3 hop rend, even if we're a
+     * single-onion service. */
+    hs_circ_setup_congestion_control(new_circ,
+                                     TO_CIRCUIT(circ)->ccontrol->sendme_inc,
+                                     false);
+  }
+
  done:
   return;
 }
@@ -550,6 +558,7 @@ setup_introduce1_data(const hs_desc_intro_point_t *ip,
     /* We can't rendezvous without the curve25519 onion key. */
     goto end;
   }
+
   /* Success, we have valid introduce data. */
   ret = 0;
 
@@ -588,6 +597,41 @@ cleanup_on_free_client_circ(circuit_t *circ)
 /* ========== */
 /* Public API */
 /* ========== */
+
+/** Setup on the given circuit congestion control with the given parameters.
+ *
+ * This function assumes that congestion control is enabled on the network and
+ * so it is the caller responsability to make sure of it. */
+void
+hs_circ_setup_congestion_control(origin_circuit_t *origin_circ,
+                                 uint8_t sendme_inc, bool is_single_onion)
+{
+  circuit_t *circ = NULL;
+  circuit_params_t circ_params = {0};
+
+  tor_assert(origin_circ);
+
+  /* Ease our lives */
+  circ = TO_CIRCUIT(origin_circ);
+
+  circ_params.cc_enabled = true;
+  circ_params.sendme_inc_cells = sendme_inc;
+
+  /* It is setup on the circuit in order to indicate that congestion control is
+   * enabled. It will be transferred to the RP crypt_path_t once the handshake
+   * is finalized in finalize_rend_circuit() for both client and service
+   * because the final hop is not available until then. */
+
+  if (is_single_onion) {
+    circ->ccontrol = congestion_control_new(&circ_params, CC_PATH_ONION_SOS);
+  } else {
+    if (get_options()->HSLayer3Nodes) {
+      circ->ccontrol = congestion_control_new(&circ_params, CC_PATH_ONION_VG);
+    } else {
+      circ->ccontrol = congestion_control_new(&circ_params, CC_PATH_ONION);
+    }
+  }
+}
 
 /** Return an introduction point circuit matching the given intro point object.
  * NULL is returned is no such circuit can be found. */
@@ -630,7 +674,7 @@ hs_circ_service_get_established_intro_circ(const hs_service_intro_point_t *ip)
  * - We've already retried this specific rendezvous circuit.
  */
 void
-hs_circ_retry_service_rendezvous_point(origin_circuit_t *circ)
+hs_circ_retry_service_rendezvous_point(const origin_circuit_t *circ)
 {
   tor_assert(circ);
   tor_assert(TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_S_CONNECT_REND);
@@ -639,10 +683,6 @@ hs_circ_retry_service_rendezvous_point(origin_circuit_t *circ)
   if (!can_relaunch_service_rendezvous_point(circ)) {
     goto done;
   }
-
-  /* Flag the circuit that we are relaunching, to avoid to relaunch twice a
-   * circuit to the same rendezvous point at the same time. */
-  circ->hs_service_side_rend_circ_has_been_relaunched = 1;
 
   /* Legacy services don't have a hidden service ident. */
   if (circ->hs_ident) {
@@ -955,6 +995,7 @@ hs_circ_handle_introduce2(const hs_service_t *service,
   data.payload_len = payload_len;
   data.link_specifiers = smartlist_new();
   data.replay_cache = ip->replay_cache;
+  data.cc_enabled = 0;
 
   if (get_subcredential_for_handling_intro2_cell(service,
                                                  &data, subcredential)) {
@@ -1071,6 +1112,12 @@ hs_circ_send_introduce1(origin_circuit_t *intro_circ,
     log_info(LD_REND, "Unable to setup INTRODUCE1 data. The chosen rendezvous "
                       "point is unusable. Closing circuit.");
     goto close;
+  }
+
+  /* If the rend circ was set up for congestion control, add that to the
+   * intro data, to signal it in an extension */
+  if (TO_CIRCUIT(rend_circ)->ccontrol) {
+    intro1_data.cc_enabled = 1;
   }
 
   /* Final step before we encode a cell, we setup the circuit identifier which
@@ -1252,6 +1299,17 @@ hs_circ_cleanup_on_repurpose(circuit_t *circ)
 
   if (circ->hs_token) {
     hs_circuitmap_remove_circuit(circ);
+  }
+
+  switch (circ->purpose) {
+  case CIRCUIT_PURPOSE_S_CONNECT_REND:
+    /* This circuit was connecting to a rendezvous point but it is being
+     * repurposed so we need to relaunch an attempt else the client will be
+     * left hanging waiting for the rendezvous. */
+    hs_circ_retry_service_rendezvous_point(TO_ORIGIN_CIRCUIT(circ));
+    break;
+  default:
+    break;
   }
 }
 

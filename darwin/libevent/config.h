@@ -1,6 +1,9 @@
 /* config.h.  Generated from config.h.in by configure.  */
 /* config.h.in.  Generated from configure.ac by autoheader.  */
 
+/* Define if building universal (internal helper macro) */
+/* #undef AC_APPLE_UNIVERSAL_BUILD */
+
 /* Define if libevent should build without support for a debug mode */
 /* #undef DISABLE_DEBUG_MODE */
 
@@ -53,6 +56,9 @@
 
 /* Define to 1 if you have the `epoll_ctl' function. */
 /* #undef HAVE_EPOLL_CTL */
+
+/* Define to 1 if you have the `epoll_pwait2' function. */
+/* #undef HAVE_EPOLL_PWAIT2 */
 
 /* Define to 1 if you have the <errno.h> header file. */
 #define HAVE_ERRNO_H 1
@@ -197,6 +203,9 @@
 
 /* Define to 1 if you have the <port.h> header file. */
 /* #undef HAVE_PORT_H */
+
+/* Define to 1 if you have the `pread' function. */
+#define HAVE_PREAD 1
 
 /* Define if we have pthreads on this system */
 #define HAVE_PTHREADS 1
@@ -344,6 +353,9 @@
 
 /* Define to 1 if you have the <sys/sendfile.h> header file. */
 /* #undef HAVE_SYS_SENDFILE_H */
+
+/* Define to 1 if you have the <sys/signalfd.h> header file. */
+/* #undef HAVE_SYS_SIGNALFD_H */
 
 /* Define to 1 if you have the <sys/socket.h> header file. */
 #define HAVE_SYS_SOCKET_H 1
@@ -594,6 +606,18 @@
 
 /* Version number of package */
 #define VERSION "2.2.0-alpha-dev"
+
+/* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
+   significant byte first (like Motorola and SPARC, unlike Intel). */
+#if defined AC_APPLE_UNIVERSAL_BUILD
+# if defined __BIG_ENDIAN__
+#  define WORDS_BIGENDIAN 1
+# endif
+#else
+# ifndef WORDS_BIGENDIAN
+/* #  undef WORDS_BIGENDIAN */
+# endif
+#endif
 
 /* Number of bits in a file offset, on hosts where this is settable. */
 /* #undef _FILE_OFFSET_BITS */

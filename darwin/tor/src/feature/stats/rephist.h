@@ -41,6 +41,16 @@ void rep_hist_note_exit_bytes(uint16_t port, size_t num_written,
                               size_t num_read);
 void rep_hist_note_exit_stream_opened(uint16_t port);
 
+void rep_hist_note_conn_opened(bool initiated, unsigned int type, int af);
+void rep_hist_note_conn_closed(bool initiated, unsigned int type, int af);
+void rep_hist_note_conn_rejected(unsigned int type, int af);
+uint64_t rep_hist_get_conn_created(bool initiated, unsigned int type, int af);
+uint64_t rep_hist_get_conn_opened(bool initiated, unsigned int type, int af);
+uint64_t rep_hist_get_conn_rejected(unsigned int type, int af);
+
+void rep_hist_note_exit_stream(unsigned int cmd);
+uint64_t rep_hist_get_exit_stream_seen(unsigned int cmd);
+
 void rep_hist_buffer_stats_init(time_t now);
 void rep_hist_buffer_stats_add_circ(circuit_t *circ,
                                     time_t end_of_interval);
@@ -64,6 +74,11 @@ void rep_hist_log_circuit_handshake_stats(time_t now);
 MOCK_DECL(int, rep_hist_get_circuit_handshake_requested, (uint16_t type));
 MOCK_DECL(int, rep_hist_get_circuit_handshake_assigned, (uint16_t type));
 
+MOCK_DECL(uint64_t, rep_hist_get_circuit_n_handshake_assigned,
+          (uint16_t type));
+MOCK_DECL(uint64_t, rep_hist_get_circuit_n_handshake_dropped,
+          (uint16_t type));
+
 void rep_hist_hs_stats_init(time_t now);
 void rep_hist_hs_stats_term(void);
 time_t rep_hist_hs_stats_write(time_t now, bool is_v3);
@@ -72,8 +87,6 @@ void rep_hist_seen_new_rp_cell(bool is_v2);
 
 char *rep_hist_get_hs_v3_stats_string(void);
 void rep_hist_hsdir_stored_maybe_new_v3_onion(const uint8_t *blinded_key);
-
-void rep_hist_note_dns_query(int type, uint8_t error);
 
 void rep_hist_free_all(void);
 
@@ -88,14 +101,15 @@ void rep_hist_note_dns_error(int type, uint8_t error);
 
 void rep_hist_consensus_has_changed(const networkstatus_t *ns);
 
-/** We have 3 stat types: tap, fast, and ntor. The max type is ntor (2) */
+/** We combine ntor and ntorv3 stats, so we have 3 stat types:
+ * tap, fast, and ntor. The max type is ntor (2) */
 #define MAX_ONION_STAT_TYPE   ONION_HANDSHAKE_TYPE_NTOR
 
 extern uint64_t rephist_total_alloc;
 extern uint32_t rephist_total_num;
 #ifdef TOR_UNIT_TESTS
-extern int onion_handshakes_requested[MAX_ONION_HANDSHAKE_TYPE+1];
-extern int onion_handshakes_assigned[MAX_ONION_HANDSHAKE_TYPE+1];
+extern int onion_handshakes_requested[MAX_ONION_STAT_TYPE+1];
+extern int onion_handshakes_assigned[MAX_ONION_STAT_TYPE+1];
 #endif
 
 #ifdef REPHIST_PRIVATE
@@ -171,6 +185,12 @@ typedef enum {
 void rep_hist_note_overload(overload_type_t overload);
 char *rep_hist_get_overload_general_line(void);
 char *rep_hist_get_overload_stats_lines(void);
+
+void rep_hist_note_tcp_exhaustion(void);
+uint64_t rep_hist_get_n_tcp_exhaustion(void);
+
+uint64_t rep_hist_get_n_read_limit_reached(void);
+uint64_t rep_hist_get_n_write_limit_reached(void);
 
 #ifdef TOR_UNIT_TESTS
 struct hs_v2_stats_t;

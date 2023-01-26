@@ -117,6 +117,7 @@
 #include "lib/cc/ctassert.h"
 #include "lib/sandbox/sandbox.h"
 #include "lib/net/buffers_net.h"
+#include "lib/net/address.h"
 #include "lib/tls/tortls.h"
 #include "lib/evloop/compat_libevent.h"
 #include "lib/compress/compress.h"
@@ -145,6 +146,8 @@
 #include "core/or/port_cfg_st.h"
 #include "feature/nodelist/routerinfo_st.h"
 #include "core/or/socks_request_st.h"
+
+#include "core/or/congestion_control_flow.h"
 
 /**
  * On Windows and Linux we cannot reliably bind() a socket to an
@@ -250,13 +253,13 @@ CONST_TO_LISTENER_CONN(const connection_t *c)
 }
 
 size_t
-connection_get_inbuf_len(connection_t *conn)
+connection_get_inbuf_len(const connection_t *conn)
 {
   return conn->inbuf ? buf_datalen(conn->inbuf) : 0;
 }
 
 size_t
-connection_get_outbuf_len(connection_t *conn)
+connection_get_outbuf_len(const connection_t *conn)
 {
     return conn->outbuf ? buf_datalen(conn->outbuf) : 0;
 }
@@ -587,7 +590,6 @@ or_connection_new(int type, int socket_family)
     /* If we aren't told an address for this connection, we should
      * presume it isn't local, and should be rate-limited. */
     TO_CONN(or_conn)->always_rate_limit_as_remote = 1;
-    connection_or_set_ext_or_identifier(or_conn);
   }
 
   return or_conn;
@@ -612,6 +614,11 @@ entry_connection_new(int type, int socket_family)
     entry_conn->entry_cfg.ipv4_traffic = 1;
   else if (socket_family == AF_INET6)
     entry_conn->entry_cfg.ipv6_traffic = 1;
+
+  /* Initialize the read token bucket to the maximum value which is the same as
+   * no rate limiting. */
+  token_bucket_rw_init(&ENTRY_TO_EDGE_CONN(entry_conn)->bucket, INT32_MAX,
+                       INT32_MAX, monotime_coarse_get_stamp());
   return entry_conn;
 }
 
@@ -623,6 +630,10 @@ edge_connection_new(int type, int socket_family)
   edge_connection_t *edge_conn = tor_malloc_zero(sizeof(edge_connection_t));
   tor_assert(type == CONN_TYPE_EXIT);
   connection_init(time(NULL), TO_CONN(edge_conn), type, socket_family);
+  /* Initialize the read token bucket to the maximum value which is the same as
+   * no rate limiting. */
+  token_bucket_rw_init(&edge_conn->bucket, INT32_MAX, INT32_MAX,
+                       monotime_coarse_get_stamp());
   return edge_conn;
 }
 
@@ -646,6 +657,9 @@ listener_connection_new(int type, int socket_family)
   listener_connection_t *listener_conn =
     tor_malloc_zero(sizeof(listener_connection_t));
   connection_init(time(NULL), TO_CONN(listener_conn), type, socket_family);
+  /* Listener connections aren't accounted for with note_connection() so do
+   * this explicitly so to count them. */
+  rep_hist_note_conn_opened(false, type, socket_family);
   return listener_conn;
 }
 
@@ -945,7 +959,6 @@ connection_free_minimal(connection_t *conn)
     connection_or_clear_identity(TO_OR_CONN(conn));
   }
   if (conn->type == CONN_TYPE_OR || conn->type == CONN_TYPE_EXT_OR) {
-    tor_free(TO_OR_CONN(conn)->ext_or_conn_id);
     tor_free(TO_OR_CONN(conn)->ext_or_auth_correct_client_hash);
     tor_free(TO_OR_CONN(conn)->ext_or_transport);
   }
@@ -1148,6 +1161,10 @@ connection_mark_for_close_internal_, (connection_t *conn,
    * the number of seconds since last successful write, so
    * we get our whole 15 seconds */
   conn->timestamp_last_write_allowed = time(NULL);
+
+  /* Note the connection close. */
+  rep_hist_note_conn_closed(conn->from_listener, conn->type,
+                            conn->socket_family);
 }
 
 /** Find each connection that has hold_open_until_flushed set to
@@ -1239,34 +1256,10 @@ create_unix_sockaddr(const char *listenaddress, char **readable_address,
 }
 #endif /* defined(HAVE_SYS_UN_H) || defined(RUNNING_DOXYGEN) */
 
-/**
- * A socket failed from resource exhaustion.
- *
- * Among other actions, warn that an accept or a connect has failed because
- * we're running out of TCP sockets we can use on current system.  Rate-limit
- * these warnings so that we don't spam the log. */
+/* Log a rate-limited warning about resource exhaustion */
 static void
-socket_failed_from_resource_exhaustion(void)
+warn_about_resource_exhaution(void)
 {
-  /* When we get to this point we know that a socket could not be
-   * established. However the kernel does not let us know whether the reason is
-   * because we ran out of TCP source ports, or because we exhausted all the
-   * FDs on this system, or for any other reason.
-   *
-   * For this reason, we are going to use the following heuristic: If our
-   * system supports a lot of sockets, we will assume that it's a problem of
-   * TCP port exhaustion. Otherwise, if our system does not support many
-   * sockets, we will assume that this is because of file descriptor
-   * exhaustion.
-   */
-  if (get_max_sockets() > 65535) {
-    /* TCP port exhaustion */
-    rep_hist_note_overload(OVERLOAD_GENERAL);
-  } else {
-    /* File descriptor exhaustion */
-    rep_hist_note_overload(OVERLOAD_FD_EXHAUSTED);
-  }
-
 #define WARN_TOO_MANY_CONNS_INTERVAL (6*60*60)
   static ratelim_t last_warned = RATELIM_INIT(WARN_TOO_MANY_CONNS_INTERVAL);
   char *m;
@@ -1278,6 +1271,17 @@ socket_failed_from_resource_exhaustion(void)
     control_event_general_status(LOG_WARN, "TOO_MANY_CONNECTIONS CURRENT=%d",
                                  n_conns);
   }
+}
+
+/**
+ * A socket failed from file descriptor exhaustion.
+ *
+ * Note down file descriptor exhaustion and log a warning. */
+static inline void
+socket_failed_from_fd_exhaustion(void)
+{
+  rep_hist_note_overload(OVERLOAD_FD_EXHAUSTED);
+  warn_about_resource_exhaution();
 }
 
 #ifdef HAVE_SYS_UN_H
@@ -1495,7 +1499,7 @@ connection_listener_new(const struct sockaddr *listensockaddr,
     if (!SOCKET_OK(s)) {
       int e = tor_socket_errno(s);
       if (ERRNO_IS_RESOURCE_LIMIT(e)) {
-        socket_failed_from_resource_exhaustion();
+        socket_failed_from_fd_exhaustion();
         /*
          * We'll call the OOS handler at the error exit, so set the
          * exhaustion flag for it.
@@ -1621,7 +1625,7 @@ connection_listener_new(const struct sockaddr *listensockaddr,
     if (! SOCKET_OK(s)) {
       int e = tor_socket_errno(s);
       if (ERRNO_IS_RESOURCE_LIMIT(e)) {
-        socket_failed_from_resource_exhaustion();
+        socket_failed_from_fd_exhaustion();
         /*
          * We'll call the OOS handler at the error exit, so set the
          * exhaustion flag for it.
@@ -1934,7 +1938,7 @@ connection_handle_listener_read(connection_t *conn, int new_type)
       connection_check_oos(get_n_open_sockets(), 0);
       return 0;
     } else if (ERRNO_IS_RESOURCE_LIMIT(e)) {
-      socket_failed_from_resource_exhaustion();
+      socket_failed_from_fd_exhaustion();
       /* Exhaustion; tell the OOS handler */
       connection_check_oos(get_n_open_sockets(), 1);
       return 0;
@@ -1995,6 +1999,7 @@ connection_handle_listener_read(connection_t *conn, int new_type)
         log_notice(LD_APP,
                    "Denying socks connection from untrusted address %s.",
                    fmt_and_decorate_addr(&addr));
+        rep_hist_note_conn_rejected(new_type, conn->socket_family);
         tor_close_socket(news);
         return 0;
       }
@@ -2004,6 +2009,7 @@ connection_handle_listener_read(connection_t *conn, int new_type)
       if (dir_policy_permits_address(&addr) == 0) {
         log_notice(LD_DIRSERV,"Denying dir connection from address %s.",
                    fmt_and_decorate_addr(&addr));
+        rep_hist_note_conn_rejected(new_type, conn->socket_family);
         tor_close_socket(news);
         return 0;
       }
@@ -2012,6 +2018,7 @@ connection_handle_listener_read(connection_t *conn, int new_type)
       /* Assess with the connection DoS mitigation subsystem if this address
        * can open a new connection. */
       if (dos_conn_addr_get_defense_type(&addr) == DOS_CONN_DEFENSE_CLOSE) {
+        rep_hist_note_conn_rejected(new_type, conn->socket_family);
         tor_close_socket(news);
         return 0;
       }
@@ -2062,6 +2069,9 @@ connection_handle_listener_read(connection_t *conn, int new_type)
     tor_assert(0);
   };
 
+  /* We are receiving this connection. */
+  newconn->from_listener = 1;
+
   if (connection_add(newconn) < 0) { /* no space, forget it */
     connection_free(newconn);
     return 0; /* no need to tear down the parent */
@@ -2073,7 +2083,7 @@ connection_handle_listener_read(connection_t *conn, int new_type)
     return 0;
   }
 
-  note_connection(true /* inbound */, conn->socket_family);
+  note_connection(true /* inbound */, newconn);
 
   return 0;
 }
@@ -2197,7 +2207,7 @@ connection_connect_sockaddr,(connection_t *conn,
      */
     *socket_error = tor_socket_errno(s);
     if (ERRNO_IS_RESOURCE_LIMIT(*socket_error)) {
-      socket_failed_from_resource_exhaustion();
+      socket_failed_from_fd_exhaustion();
       connection_check_oos(get_n_open_sockets(), 1);
     } else {
       log_warn(LD_NET,"Error creating network socket: %s",
@@ -2218,6 +2228,30 @@ connection_connect_sockaddr,(connection_t *conn,
    * failure.
    */
   connection_check_oos(get_n_open_sockets(), 0);
+
+  /* From ip(7): Inform the kernel to not reserve an ephemeral port when using
+   * bind(2) with a port number of 0. The port will later be automatically
+   * chosen at connect(2) time, in a way that allows sharing a source port as
+   * long as the 4-tuple is unique.
+   *
+   * This is needed for relays using OutboundBindAddresses because the port
+   * value in the bind address is set to 0. */
+#ifdef IP_BIND_ADDRESS_NO_PORT
+  static int try_ip_bind_address_no_port = 1;
+  if (bindaddr && try_ip_bind_address_no_port &&
+      setsockopt(s, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &(int){1}, sizeof(int))) {
+    if (errno == EINVAL) {
+      log_notice(LD_NET, "Tor was built with support for "
+                         "IP_BIND_ADDRESS_NO_PORT, but the current kernel "
+                         "doesn't support it. This might cause Tor to run out "
+                         "of ephemeral ports more quickly.");
+      try_ip_bind_address_no_port = 0;
+    } else {
+      log_warn(LD_NET, "Error setting IP_BIND_ADDRESS_NO_PORT on new "
+                       "connection: %s", tor_socket_strerror(errno));
+    }
+  }
+#endif
 
   if (bindaddr && bind(s, bindaddr, bindaddr_len) < 0) {
     *socket_error = tor_socket_errno(s);
@@ -2246,7 +2280,7 @@ connection_connect_sockaddr,(connection_t *conn,
     }
   }
 
-  note_connection(false /* outbound */, conn->socket_family);
+  note_connection(false /* outbound */, conn);
 
   /* it succeeded. we're connected. */
   log_fn(inprogress ? LOG_DEBUG : LOG_INFO, LD_NET,
@@ -3457,6 +3491,19 @@ connection_bucket_read_limit(connection_t *conn, time_t now)
     base = get_cell_network_size(or_conn->wide_circ_ids);
   }
 
+  /* Edge connection have their own read bucket due to flow control being able
+   * to set a rate limit for them. However, for exit connections, we still need
+   * to honor the global bucket as well. */
+  if (CONN_IS_EDGE(conn)) {
+    const edge_connection_t *edge_conn = CONST_TO_EDGE_CONN(conn);
+    conn_bucket = token_bucket_rw_get_read(&edge_conn->bucket);
+    if (conn->type == CONN_TYPE_EXIT) {
+      /* Decide between our limit and the global one. */
+      goto end;
+    }
+    return conn_bucket;
+  }
+
   if (!connection_is_rate_limited(conn)) {
     /* be willing to read on local conns even if our buckets are empty */
     return conn_bucket>=0 ? conn_bucket : 1<<14;
@@ -3467,6 +3514,7 @@ connection_bucket_read_limit(connection_t *conn, time_t now)
     global_bucket_val = MIN(global_bucket_val, relayed);
   }
 
+ end:
   return connection_bucket_get_share(base, priority,
                                      global_bucket_val, conn_bucket);
 }
@@ -3644,6 +3692,13 @@ connection_buckets_decrement(connection_t *conn, time_t now,
 
   record_num_bytes_transferred_impl(conn, now, num_read, num_written);
 
+  /* Edge connection need to decrement the read side of the bucket used by our
+   * congestion control. */
+  if (CONN_IS_EDGE(conn) && num_read > 0) {
+    edge_connection_t *edge_conn = TO_EDGE_CONN(conn);
+    token_bucket_rw_dec(&edge_conn->bucket, num_read, 0);
+  }
+
   if (!connection_is_rate_limited(conn))
     return; /* local IPs are free */
 
@@ -3697,14 +3752,16 @@ connection_write_bw_exhausted(connection_t *conn, bool is_global_bw)
 void
 connection_consider_empty_read_buckets(connection_t *conn)
 {
+  int is_global = 1;
   const char *reason;
 
-  if (!connection_is_rate_limited(conn))
+  if (CONN_IS_EDGE(conn) &&
+             token_bucket_rw_get_read(&TO_EDGE_CONN(conn)->bucket) <= 0) {
+    reason = "edge connection read bucket exhausted. Pausing.";
+    is_global = false;
+  } else if (!connection_is_rate_limited(conn)) {
     return; /* Always okay. */
-
-  int is_global = 1;
-
-  if (token_bucket_rw_get_read(&global_bucket) <= 0) {
+  } else if (token_bucket_rw_get_read(&global_bucket) <= 0) {
     reason = "global read bucket exhausted. Pausing.";
   } else if (connection_counts_as_relayed_traffic(conn, approx_time()) &&
              token_bucket_rw_get_read(&global_relayed_bucket) <= 0) {
@@ -3714,8 +3771,9 @@ connection_consider_empty_read_buckets(connection_t *conn)
              token_bucket_rw_get_read(&TO_OR_CONN(conn)->bucket) <= 0) {
     reason = "connection read bucket exhausted. Pausing.";
     is_global = false;
-  } else
+  } else {
     return; /* all good, no need to stop it */
+  }
 
   LOG_FN_CONN(conn, (LOG_DEBUG, LD_NET, "%s", reason));
   connection_read_bw_exhausted(conn, is_global);
@@ -3818,6 +3876,10 @@ connection_bucket_refill_single(connection_t *conn, uint32_t now_ts)
   if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
     or_connection_t *or_conn = TO_OR_CONN(conn);
     token_bucket_rw_refill(&or_conn->bucket, now_ts);
+  }
+
+  if (CONN_IS_EDGE(conn)) {
+    token_bucket_rw_refill(&TO_EDGE_CONN(conn)->bucket, now_ts);
   }
 }
 
@@ -4556,9 +4618,9 @@ connection_handle_write_impl(connection_t *conn, int force)
       !dont_stop_writing) { /* it's done flushing */
     if (connection_finished_flushing(conn) < 0) {
       /* already marked */
-      return -1;
+      goto err;
     }
-    return 0;
+    goto done;
   }
 
   /* Call even if result is 0, since the global write bucket may
@@ -4568,7 +4630,17 @@ connection_handle_write_impl(connection_t *conn, int force)
   if (n_read > 0 && connection_is_reading(conn))
     connection_consider_empty_read_buckets(conn);
 
+ done:
+  /* If this is an edge connection with congestion control, check to see
+   * if it is time to send an xon */
+  if (conn_uses_flow_control(conn)) {
+    flow_control_decide_xon(TO_EDGE_CONN(conn), n_written);
+  }
+
   return 0;
+
+ err:
+  return -1;
 }
 
 /* DOCDOC connection_handle_write */

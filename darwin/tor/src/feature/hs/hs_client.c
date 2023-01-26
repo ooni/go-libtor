@@ -11,12 +11,15 @@
 #include "core/or/or.h"
 #include "app/config/config.h"
 #include "core/crypto/hs_ntor.h"
+#include "core/crypto/onion_crypto.h"
 #include "core/mainloop/connection.h"
 #include "core/or/circuitbuild.h"
 #include "core/or/circuitlist.h"
 #include "core/or/circuituse.h"
 #include "core/or/connection_edge.h"
+#include "core/or/congestion_control_common.h"
 #include "core/or/extendinfo.h"
+#include "core/or/protover.h"
 #include "core/or/reasons.h"
 #include "feature/client/circpathbias.h"
 #include "feature/dirclient/dirclient.h"
@@ -641,6 +644,16 @@ send_introduce1(origin_circuit_t *intro_circ,
     goto tran_err;
   }
 
+  /* Check if the rendevous circuit was setup WITHOUT congestion control but if
+   * it is enabled and the service supports it. This can happen, see
+   * setup_rendezvous_circ_congestion_control() and so close rendezvous circuit
+   * so another one can be created. */
+  if (TO_CIRCUIT(rend_circ)->ccontrol == NULL && congestion_control_enabled()
+      && hs_desc_supports_congestion_control(desc)) {
+    circuit_mark_for_close(TO_CIRCUIT(rend_circ), END_CIRC_REASON_INTERNAL);
+    goto tran_err;
+  }
+
   /* We need to find which intro point in the descriptor we are connected to
    * on intro_circ. */
   ip = find_desc_intro_point_by_ident(intro_circ->hs_ident, desc);
@@ -776,6 +789,45 @@ client_intro_circ_has_opened(origin_circuit_t *circ)
   connection_ap_attach_pending(1);
 }
 
+/** Setup the congestion control parameters on the given rendezvous circuit.
+ * This looks at the service descriptor flow control line (if any).
+ *
+ * It is possible that we are unable to set congestion control on the circuit
+ * if the descriptor can't be found. In that case, the introduction circuit
+ * can't be opened without it so a fetch will be triggered.
+ *
+ * However, if the descriptor asks for congestion control but the RP circuit
+ * doesn't have it, it will be closed and a new circuit will be opened. */
+static void
+setup_rendezvous_circ_congestion_control(origin_circuit_t *circ)
+{
+  tor_assert(circ);
+
+  /* Setup congestion control parameters on the circuit. */
+  const hs_descriptor_t *desc =
+    hs_cache_lookup_as_client(&circ->hs_ident->identity_pk);
+  if (desc == NULL) {
+    /* This is possible because between launching the circuit and the circuit
+     * ending in opened state, the descriptor could have been removed from the
+     * cache. In this case, we just can't setup congestion control. */
+    return;
+  }
+
+  /* Check if the service lists support for congestion control in its
+   * descriptor. If not, we don't setup congestion control. */
+  if (!hs_desc_supports_congestion_control(desc)) {
+    return;
+  }
+
+  /* If network doesn't enable it, do not setup. */
+  if (!congestion_control_enabled()) {
+    return;
+  }
+
+  hs_circ_setup_congestion_control(circ, desc->encrypted_data.sendme_inc,
+                                   desc->encrypted_data.single_onion_service);
+}
+
 /** Called when a rendezvous circuit has opened. */
 static void
 client_rendezvous_circ_has_opened(origin_circuit_t *circ)
@@ -804,6 +856,9 @@ client_rendezvous_circ_has_opened(origin_circuit_t *circ)
 
   log_info(LD_REND, "Rendezvous circuit has opened to %s.",
            safe_str_client(extend_info_describe(rp_ei)));
+
+  /* Setup congestion control parameters on the circuit. */
+  setup_rendezvous_circ_congestion_control(circ);
 
   /* Ignore returned value, nothing we can really do. On failure, the circuit
    * will be marked for close. */
@@ -1909,7 +1964,7 @@ void
 hs_client_circuit_cleanup_on_free(const circuit_t *circ)
 {
   bool has_timed_out;
-  rend_intro_point_failure_t failure = INTRO_POINT_FAILURE_GENERIC;
+  rend_intro_point_failure_t failure = INTRO_POINT_FAILURE_UNREACHABLE;
   const origin_circuit_t *orig_circ = NULL;
 
   tor_assert(circ);

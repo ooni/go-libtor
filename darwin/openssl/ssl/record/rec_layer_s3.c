@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the OpenSSL license (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -16,6 +16,7 @@
 #include <openssl/rand.h>
 #include "record_local.h"
 #include "../packet_local.h"
+#include "internal/cryptlib.h"
 
 #if     defined(OPENSSL_SMALL_FOOTPRINT) || \
         !(      defined(AESNI_ASM) &&   ( \
@@ -983,11 +984,14 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
         }
 
         /*
-         * Reserve some bytes for any growth that may occur during encryption.
-         * This will be at most one cipher block or the tag length if using
-         * AEAD. SSL_RT_MAX_CIPHER_BLOCK_SIZE covers either case.
-         */
-        if (!WPACKET_reserve_bytes(thispkt, SSL_RT_MAX_CIPHER_BLOCK_SIZE,
+        * Reserve some bytes for any growth that may occur during encryption. If
+        * we are adding the MAC independently of the cipher algorithm, then the
+        * max encrypted overhead does not need to include an allocation for that
+        * MAC
+        */
+        if (!WPACKET_reserve_bytes(thispkt,
+                                   SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD
+                                   - mac_size,
                                    NULL)
                    /*
                     * We also need next the amount of bytes written to this
@@ -1037,6 +1041,9 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
 
         /* Allocate bytes for the encryption overhead */
         if (!WPACKET_get_length(thispkt, &origlen)
+                   /* Check we allowed enough room for the encryption growth */
+                || !ossl_assert(origlen + SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD
+                                - mac_size >= thiswr->length)
                    /* Encryption should never shrink the data! */
                 || origlen > thiswr->length
                 || (thiswr->length > origlen
