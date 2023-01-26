@@ -1,3 +1,4 @@
+//go:build none
 // +build none
 
 package main
@@ -121,15 +122,16 @@ func main() {
 			"torHash":      torHash,
 		})
 		ioutil.WriteFile("README.md", buf.Bytes(), 0644)
-		buff, err := json.Marshal(lockJson{
+		buff, err := json.MarshalIndent(lockJson{
 			Zlib:     zlibHash,
 			Libevent: libeventHash,
 			Openssl:  opensslHash,
 			Tor:      torHash,
-		})
+		}, "", "  ")
 		if err != nil {
 			panic(err)
 		}
+		buff = append(buff, '\n')
 		ioutil.WriteFile("lock.json", buff, 0644)
 	}
 }
@@ -706,7 +708,7 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 	if lock != nil {
 		checkout = lock.Tor
 	} else {
-		checkout = "release-0.4.6"
+		checkout = "maint-0.4.7"
 	}
 	checkouter := exec.Command("git", "checkout", checkout)
 	checkouter.Dir = tgtf
@@ -734,7 +736,16 @@ func wrapTor(tgt string, lock *lockJson) (string, string, error) {
 	if err := autogen.Run(); err != nil {
 		return "", "", err
 	}
-	configure := exec.Command("./configure", "--disable-asciidoc")
+	configureArgs := []string{
+		"--disable-asciidoc",
+	}
+	// If you're using M1 or later CPUs, homebrew installs under /opt/local as
+	// opposed to /usr/local. We need to tell tor's configure about that.
+	if info, err := os.Stat("/opt/homebrew"); err == nil && info.IsDir() {
+		configureArgs = append(configureArgs, "--with-libevent-dir=/opt/homebrew/")
+		configureArgs = append(configureArgs, "--with-openssl-dir=/opt/homebrew/opt/openssl@1.1/")
+	}
+	configure := exec.Command("./configure", configureArgs...)
 	configure.Dir = tgtf
 	configure.Stdout = os.Stdout
 	configure.Stderr = os.Stderr
