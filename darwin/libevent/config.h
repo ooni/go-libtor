@@ -457,7 +457,7 @@
 #define LT_OBJDIR ".libs/"
 
 /* Numeric representation of the version */
-#define NUMERIC_VERSION 0x02020001
+#define NUMERIC_VERSION 0x02020100
 
 /* Name of package */
 #define PACKAGE "libevent"
@@ -469,7 +469,7 @@
 #define PACKAGE_NAME "libevent"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "libevent 2.2.0-alpha-dev"
+#define PACKAGE_STRING "libevent 2.2.1-alpha-dev"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "libevent"
@@ -478,7 +478,7 @@
 #define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "2.2.0-alpha-dev"
+#define PACKAGE_VERSION "2.2.1-alpha-dev"
 
 /* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
@@ -605,7 +605,7 @@
 
 
 /* Version number of package */
-#define VERSION "2.2.0-alpha-dev"
+#define VERSION "2.2.1-alpha-dev"
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

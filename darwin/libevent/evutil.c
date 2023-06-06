@@ -31,7 +31,6 @@
 #include <winsock2.h>
 #include <winerror.h>
 #include <ws2tcpip.h>
-#include <stringapiset.h>
 #ifdef EVENT__HAVE_AFUNIX_H
 #include <afunix.h>
 #endif
@@ -599,6 +598,17 @@ evutil_make_listen_socket_ipv6only(evutil_socket_t sock)
 	int one = 1;
 	return setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (void*) &one,
 	    (ev_socklen_t)sizeof(one));
+#endif
+	return 0;
+}
+
+int
+evutil_make_listen_socket_not_ipv6only(evutil_socket_t sock)
+{
+#if defined(IPV6_V6ONLY)
+	int zero = 0;
+	return setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (void *)&zero,
+		(ev_socklen_t)sizeof(zero));
 #endif
 	return 0;
 }

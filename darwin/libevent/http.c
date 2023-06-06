@@ -582,7 +582,7 @@ evhttp_maybe_add_content_length_header(struct evkeyvalq *headers,
     size_t content_length)
 {
 	if (evhttp_find_header(headers, "Transfer-Encoding") == NULL &&
-	    evhttp_find_header(headers,	"Content-Length") == NULL) {
+	    evhttp_find_header(headers, "Content-Length") == NULL) {
 		char len[22];
 		evutil_snprintf(len, sizeof(len), EV_SIZE_FMT,
 		    EV_SIZE_ARG(content_length));
@@ -599,6 +599,8 @@ evhttp_make_header_response(struct evhttp_connection *evcon,
     struct evhttp_request *req)
 {
 	int is_keepalive = evhttp_is_connection_keepalive(req->input_headers);
+	int need_body = evhttp_response_needs_body(req);
+
 	evbuffer_add_printf(bufferevent_get_output(evcon->bufev),
 	    "HTTP/%d.%d %d %s\r\n",
 	    req->major, req->minor, req->response_code,
@@ -616,8 +618,7 @@ evhttp_make_header_response(struct evhttp_connection *evcon,
 			evhttp_add_header(req->output_headers,
 			    "Connection", "keep-alive");
 
-		if ((req->minor >= 1 || is_keepalive) &&
-		    evhttp_response_needs_body(req)) {
+		if ((req->minor >= 1 || is_keepalive) && need_body) {
 			/*
 			 * we need to add the content length if the
 			 * user did not give it, this is required for
@@ -630,7 +631,7 @@ evhttp_make_header_response(struct evhttp_connection *evcon,
 	}
 
 	/* Potentially add headers for unidentified content. */
-	if (evhttp_response_needs_body(req)) {
+	if (need_body) {
 		if (evhttp_find_header(req->output_headers,
 			"Content-Type") == NULL
 		    && evcon->http_server->default_content_type) {
@@ -3555,7 +3556,6 @@ evhttp_parse_query_impl(const char *str, struct evkeyvalq *headers,
     int is_whole_uri, unsigned flags)
 {
 	char *line=NULL;
-	char *argument;
 	char *p;
 	const char *query_part;
 	int result = -1;
@@ -3583,13 +3583,12 @@ evhttp_parse_query_impl(const char *str, struct evkeyvalq *headers,
 		goto error;
 	}
 
-	p = argument = line;
+	p = line;
 	while (p != NULL && *p != '\0') {
 		char *key, *value, *decoded_value;
 		int err;
-		argument = strsep(&p, "&");
 
-		value = argument;
+		value = strsep(&p, "&");
 		key = strsep(&value, "=");
 		if (flags & EVHTTP_URI_QUERY_NONCONFORMANT) {
 			if (value == NULL)
